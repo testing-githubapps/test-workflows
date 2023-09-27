@@ -1,0 +1,35 @@
+name: Enterprise Server to Enterprise Cloud Issue Migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ghes_hostname:
+        description: 'Hostname for GHES instance'
+        required: true
+      source_repo:
+        description: 'Source repository <org/repo> in GHES'
+        required: true
+      target_repo:
+        description: 'Target repository <org/repo> in GHEC'
+        required: true
+
+jobs:
+  migrate-issues:
+    runs-on: ubuntu-latest
+    env:
+      GHES_PAT: ${{ secrets.PAT_GHES }}
+      GHEC_PAT: ${{ secrets.PAT_GHEC }}
+      BASE_GHES_HOSTNAME: ${{ github.event.inputs.base_ghes_hostname }}
+      SOURCE_REPO: ${{ github.event.inputs.source_repo }}
+      TARGET_REPO: ${{ github.event.inputs.target_repo }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python libraries
+        run: pip3 install -r requirements.txt
+
+      - name: Migrate issues
+        run: python3 migrate_issues.py
+
+

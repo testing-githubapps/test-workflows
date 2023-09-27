@@ -51,7 +51,7 @@ def migrate_issues(source_name, dest_name):
       print(error)
 
 # Specify the repository details
-source_name = "benjamins/testing-issues"
-dest_name = "testing-githubapps/issue-test"
+source_name = os.environ['SOURCE_REPO']
+dest_name = os.environ['TARGET_REPO']
 
 migrate_issues(source_name, dest_name)
