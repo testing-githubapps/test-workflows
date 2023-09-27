@@ -1,5 +1,4 @@
 from github import Github, GithubObject, Auth
-from dotenv import load_dotenv
 import os
 
 source_auth = Auth.Token(os.environ["GHES_TOKEN"])
