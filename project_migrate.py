@@ -1,22 +1,14 @@
 
 from gql import gql, Client
 from gql.transport.requests import RequestsHTTPTransport
-from dotenv import load_dotenv
 import os
 
-# Load the environment variables from the .env file
-load_dotenv()
-
 # Specify the source and destination repository details
-source_token = os.getenv("GHES_TOKEN")
-dest_token = os.getenv("GHEC_TOKEN")
-
-# Specify the repository details
-source_name = "benjamins/testing-issues"
-dest_name = "testing-githubapps/issue-test"
+source_token = os.environ["GHES_PAT"]
+dest_token = os.environ["GHEC_PAT"]
 
 # GraphQL API endpoint URLs for source and destination instances
-source_endpoint = os.getenv("GHES_HOST") + "/api/graphql"
+source_endpoint = os.environ["BASE_GHES_HOSTNAME"] + "/api/graphql"
 dest_endpoint = "https://api.github.com/graphql"
 
 # Create a GraphQL client for the source and destination instances
@@ -187,7 +179,7 @@ def migrate_projects(source_name, dest_name):
       print(error)
 
 # Specify the repository details
-source_name = "benjamins/testing-issues"
-dest_name = "testing-githubapps/issue-test"
+source_name = os.environ['SOURCE_REPO']
+dest_name = os.environ['TARGET_REPO']
 
 migrate_projects(source_name, dest_name)
