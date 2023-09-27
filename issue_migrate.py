@@ -2,14 +2,11 @@ from github import Github, GithubObject, Auth
 from dotenv import load_dotenv
 import os
 
-# Load the environment variables from the .env file
-load_dotenv()
-
-source_auth = Auth.Token(os.getenv("GHES_TOKEN"))
-dest_auth = Auth.Token(os.getenv("GHEC_TOKEN"))
+source_auth = Auth.Token(os.environ["GHES_TOKEN"])
+dest_auth = Auth.Token(os.environ["GHEC_TOKEN"])
 
 # Create a PyGithub instance by providing an access token or username/password
-source_github = Github(base_url=os.getenv("GHES_HOST") + "/api/v3", auth=source_auth)
+source_github = Github(base_url=os.environ["GHES_HOST"] + "/api/v3", auth=source_auth)
 dest_github = Github(auth=dest_auth)
 
 # create a function to filter assignees and add it to the body the issue
