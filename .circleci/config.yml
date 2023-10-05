@@ -16,7 +16,7 @@ jobs:
       - checkout
       - run:
           name: "Say hello"
-          command: "echo $CIRCLE_JOB"
+          command: "echo CIRCLE_PR_NUMBER"
 
 # Orchestrate jobs using workflows
 # See: https://circleci.com/docs/configuration-reference/#workflows
