@@ -1,24 +1,1706 @@
-# Use the latest 2.1 version of CircleCI pipeline process engine.
-# See: https://circleci.com/docs/configuration-reference
 version: 2.1
 
-# Define a job to be invoked later in a workflow.
-# See: https://circleci.com/docs/configuration-reference/#jobs
+orbs:
+  slack: circleci/slack@4.5.0
+  swissknife: test-orbs/swissknife@dev:limon/publish.0.2
+
+defaults:
+    artifactory_cloud_auth: &artifactory_cloud_auth
+        auth:
+            username: $ARTIFACTORY_USER
+            password: $ARTIFACTORY_CLOUD_API_KEY
+
+    docker_default: &docker_default
+        docker:
+          - image: &docker_default_image docker-snapshot.dr-uw2.itc.com/discoverycache:latest
+            user: &docker_default_user asruser
+            <<: *artifactory_cloud_auth
+
+    docker_testing: &docker_testing
+        docker:
+          # Update tag to specific test version as needed
+          - image: &docker_testing_image docker-snapshot.dr-uw2.testitc.com/discoverycache:test-v2023051801
+            user: *docker_default_user
+            <<: *artifactory_cloud_auth
+          - image: docker-tester-snapshot.dr-uw2.itc.com/docker.io/redis:6.2.6
+            <<: *artifactory_cloud_auth
+
+aliases:
+  - &writable_github_ssh_key
+    fingerprints:
+      # ccwutil SSH key to allow gh-pages to push to git
+      - "13:f8:4d:21:5e:83:79:a8:93:99:0c:ca:cb:5e:65:75"
+
+  - &ccwutil_github_ssh_user_key
+    fingerprints:
+      # ccwutil SSH user key that can read public repos on github
+      - "0d:6e:1b:cf:93:28:03:fe:a4:4f:96:ea:df:03:05:3d"
+
+  - &git_config
+    name: Git config
+    command: |
+        git config user.email "ccwutil@.com"
+        git config user.name "ccwutil"
+
+  # Running our own checkout routine is recommended by CircleCI support
+  - &te_checkout
+    name: git checkout script
+    command: |
+      export SSH_CONFIG_DIR="${HOME}/.ssh"
+      git --version
+      if [ ! -f "${SSH_CONFIG_DIR}/id_rsa" ]; then
+        printf "%s" "$CHECKOUT_KEY" > "$SSH_CONFIG_DIR/id_rsa"
+        chmod 0600 "$SSH_CONFIG_DIR/id_rsa"
+      fi
+      if (: "${CHECKOUT_KEY_PUBLIC?}") 2>/dev/null; then
+        rm -f "$SSH_CONFIG_DIR/id_rsa.pub"
+        printf "%s" "$CHECKOUT_KEY_PUBLIC" > "$SSH_CONFIG_DIR/id_rsa.pub"
+      fi
+
+      export GIT_SSH_COMMAND='ssh -i "$SSH_CONFIG_DIR/id_rsa" -o UserKnownHostsFile="$SSH_CONFIG_DIR/known_hosts"'
+
+      # use git+ssh instead of https
+      git config --global url."ssh://git@git.corp. .com".insteadOf "https://git.corp. .com" || true
+      git config --global gc.auto 0 || true
+
+      echo 'Fetching into existing repository'
+      cd "${HOME}/project"
+      git remote set-url origin "$CIRCLE_REPOSITORY_URL" || true
+      git config extensions.partialClone origin
+
+      # Use retry mechanism for git fetch command.
+      function retry {
+        local max_attempts=5
+        local timeout=2
+        local exponent=2
+        local attempt=1
+        # Execute the command, break if success else retry up to max_attempts times.
+        while [[ $attempt -le $max_attempts ]]; do
+          "$@" && break
+          sleep "$timeout"
+          timeout=$(( ++attempt ** exponent ))
+          [[ $attempt -gt $max_attempts ]] && echo "Failed to execute cmd after $max_attempts retries" 1>&2 && exit 1
+        done
+      }
+
+      echo 'Fetching from remote repository'
+      if [ -n "$CIRCLE_TAG" ]; then
+        retry git fetch --force --filter=blob:none --tags origin
+        echo 'Checking out tag'
+        git checkout --force "$CIRCLE_TAG"
+        git reset --hard "$CIRCLE_SHA1"
+      else
+        retry git fetch --force --filter=blob:none --no-tags origin +refs/heads/"$CIRCLE_BRANCH":refs/remotes/origin/"$CIRCLE_BRANCH"
+        echo 'Checking out branch'
+        git checkout --force -B "$CIRCLE_BRANCH" "$CIRCLE_SHA1"
+        git --no-pager log --no-color -n 1 --format='HEAD is now at %h %s'
+      fi
+
+  - &prerun
+    name: preRun - low-risk PR check
+    command: node tools/ci/preRun.js # sets $LOW_RISK_PR
+  - &postrun
+    name: postRun
+    command: |
+        node tools/ci/postRun.js \
+            --token $GH_AUTH_TOKEN \
+            --pr $CIRCLE_PULL_REQUEST \
+            --branch $CIRCLE_BRANCH \
+            --build-num $CIRCLE_BUILD_NUM \
+              || true
+
+  - &netrc_config
+    name: Configure ~/.netrc
+    command: |
+        ARTIFACTORY_USER=$ARTIFACTORY_USER ARTIFACTORY_API_KEY=$ARTIFACTORY_API_KEY ARTIFACTORY_CLOUD_API_KEY=$ARTIFACTORY_CLOUD_API_KEY bin/netrc.js
+
+  - &npmrc_config
+    name: Configure ~/.npmrc
+    command: |
+        ARTIFACTORY_USER=$ARTIFACTORY_USER ARTIFACTORY_API_KEY=$ARTIFACTORY_API_KEY bin/npmScopes.sh
+
+  - &docker_list_images
+    name: Docker List Images
+    no_output_timeout: 1m
+    command: docker images
+
+  # Copy all rush logs, build, test, cover to ./output/rush-logs/
+  - &copy_rush_logs
+    name: Copy logs
+    when: always
+    command: |
+        # Rush projects shouldn't be deeper than 5 folders from root (as per rush.json), +1 for rush-logs
+        # This makes the find command 15 times faster
+        find . -maxdepth 6 -type d -name "rush-logs" ! -path "./common/temp/*" ! -path "./output/*" -exec cp -r {} output/ \;
+
+  - &push_stats_to_prometheus
+    name: Push stats to Prometheus and test-reports to S3
+    when: always
+    no_output_timeout: 5m
+    command: |
+        bin/retry.sh tools/ci/pushMetrics.js \
+          --branch $CIRCLE_BRANCH \
+          --build-num $CIRCLE_BUILD_NUM \
+          --pipeline-id << pipeline.id >> \
+          --workflow-id $CIRCLE_WORKFLOW_ID \
+          --circle-token $CIRCLE_TOKEN \
+          --aws-access-key-id $DEV_TERRAFORM_AWS_KEY \
+          --aws-secret-access-key $DEV_TERRAFORM_AWS_SECRET
+
+  - &slack-main-branch-failure-notify
+    channel: << parameters.main_alert_channel >>
+    event: fail
+    branch_pattern: main
+    custom: |
+      {
+        "blocks": [
+          {
+            "type": "header",
+            "text": {
+              "type": "plain_text",
+              "text": ":red: MAIN BUILD FAILURE"
+            }
+          },
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": "- Job failure details: <$CIRCLE_BUILD_URL|$CIRCLE_JOB>"
+            }
+          }
+        ]
+      }
+
+  - &slack-failure-notify-template
+    custom: |
+      {
+        "blocks": [
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": ":red: *<$CIRCLE_PULL_REQUEST|$CIRCLE_BRANCH>* by <@$CIRCLE_USERNAME> failed <$CIRCLE_BUILD_URL|$CIRCLE_JOB>"
+            }
+          }
+        ]
+      }
+
+  - &slack-failure-notify
+    channel: te-build-notifications
+    event: fail
+    <<: *slack-failure-notify-template
+
+  - &slack-success-notify
+    channel: te-build-notifications
+    event: pass
+    custom: |
+      {
+        "blocks": [
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": ":green: *<$CIRCLE_PULL_REQUEST|$CIRCLE_BRANCH>* by <@$CIRCLE_USERNAME> complete"
+            }
+          }
+        ]
+      }
+
+  
+  # Certain jobs can be ignored for branches
+  - &skip-if-ignore-matches
+    name: Exclude ignored branches
+    command: |
+      IGNORE=0
+      if [[ "$CIRCLE_BRANCH" =~ ^cicd/.* ]]; then
+        echo "cicd workflow"
+        IGNORE=1
+      elif [[ "$CIRCLE_BRANCH" =~ ^(revert-.*)?deploy/.* ]]; then
+        echo "gitops deployment workflow"
+        IGNORE=1
+      elif [[ "$CIRCLE_BRANCH" =~ ^terraform.* ]]; then
+        echo "terraform workflow"
+        IGNORE=1
+      fi
+      if [[ "$IGNORE" == 1 ]]; then
+        circleci-agent step halt
+      fi
+
+  # Verify whether the required labels (e.g: x-prenv, qa-prenv, etc) are attached in the PR
+  - &check-deploy-pr-env-required-labels
+    name: Check PR labels
+    command: infra/cicd/cmd/deploy_prenv/deploy_prenv.sh
+    environment:
+      FAST_CHECK: "true"
+
+  # Verify whether the required labels (e.g: "tepr-*") are attached in the PR
+  - &check-deploy-pr-env-aws-required-labels
+    name: Check PR labels
+    command: infra/cicd/cmd/deploy_prenv_aws/deploy_prenv_aws.sh
+    environment:
+      FAST_CHECK: "true"
+
+commands:
+    # Includes checkout, creds set-up and rush install
+    rush_build_bootstrap_commands:
+        steps:
+            - run:
+                <<: *skip-if-ignore-matches
+            - run:
+                <<: *te_checkout
+            - add_ssh_keys:
+                <<: *writable_github_ssh_key
+            - add_ssh_keys:
+                <<: *ccwutil_github_ssh_user_key
+            - run:
+                <<: *git_config
+            - run:
+                <<: *netrc_config
+            - run:
+                # The default bashrc bails on non-interactive terminals. Reset it so
+                # we can add Emscripten env to it
+                name: Reset .bashrc
+                command: echo "" > $HOME/.bashrc
+            - run:
+                name: Save Workflow ID
+                command: tools/ci/scripts/save-workflow-id.sh
+            - run:
+                name: Clean old rush telemetry files
+                command: rm -rf common/temp/telemetry
+            - run:
+                <<: *npmrc_config
+            - run:
+                name: Install dependencies
+                command: node common/scripts/install-run-rush.js install
+            - run:
+                <<: *prerun
+
+    # Custom bootsrap commands for use with runners
+    rush_build_bootstrap_commands_for_runners:
+        steps:
+            - run:
+                name: Runner identification
+                command: hostname
+            - run:
+                <<: *skip-if-ignore-matches
+            - add_ssh_keys:
+                <<: *ccwutil_github_ssh_user_key
+            - run:
+                <<: *te_checkout
+            - run:
+                <<: *git_config
+            - run:
+                <<: *netrc_config
+            - run:
+                # The default bashrc bails on non-interactive terminals. Reset it so
+                # we can add Emscripten env to it
+                name: Reset .bashrc (for runners)
+                command: echo "" > $HOME/.bashrc
+            - run:
+                name: Save Workflow ID
+                command: tools/ci/scripts/save-workflow-id.sh
+            - run:
+                <<: *npmrc_config
+            - run:
+                name: Install dependencies on the bootstrap for runners
+                command: |
+                    # Avoid use of public github for jq when it exists on the runner
+                    export NODE_JQ_SKIP_INSTALL_BINARY=true
+                    node common/scripts/install-run-rush.js install
+            - run:
+                <<: *prerun
+
+    rush_build_and_test_commands:
+        steps:
+            - run:
+                  name: Prevent Large File Commits
+                  command: tools/build/scripts/find-big-files.sh
+            # This pre-build step is to fail CCI build earlier in case of lint issues
+            # and prevent running of time-consuming Build step.
+            - run:
+                  name: Pre-Build Lint
+                  command: |
+                      node common/scripts/install-run-rush.js build -t @te/config
+                      node common/scripts/install-run-rush.js lint:self
+                      node common/scripts/install-run-rush.js lint --verbose --parallelism 16 --timeline 
+                      node common/scripts/install-run-rush.js lint:codeowners
+
+                  environment:
+                      # We have a post-build lint step which should not use the cache written here
+                      RUSH_BUILD_CACHE_WRITE_ALLOWED: 0
+            - run:
+                  name: Build
+                  no_output_timeout: 30m
+                  command: |
+                      if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                      node common/scripts/install-run-rush.js build:release --parallelism 14 --timeline
+            # This post-build step is to fix package dependency validation that can only occur
+            # after the package has been built (https://jira.corp. .com/browse/te-12145)
+            - run:
+                  name: Post-Build Lint
+                  command: |
+                      node common/scripts/install-run-rush.js lint --verbose --parallelism 16 --timeline
+            - run:
+                <<: *copy_rush_logs
+            - run:
+                name: Publish logs to gh-pages
+                when: always
+                command: |
+                    CACHE_DIR=output/gh-pages tools/ci/publishArtifacts.js --branch $CIRCLE_BRANCH --build-num $CIRCLE_BUILD_NUM --url $CIRCLE_BUILD_URL --source output --match rush-logs/** --bucket dev-te-build-artifacts
+
+    rush_build_debug_and_unit_test_commands:
+        steps:
+            # PR Comment Clean
+            - run:
+                name: Pull Request Comment (clean)
+                when: always
+                command: |
+                    tools/ci/comments/unitTestComment.js \
+                      --clean \
+                      --branch $CIRCLE_BRANCH \
+                      --build-num $CIRCLE_BUILD_NUM \
+                      --token $GH_AUTH_TOKEN \
+                      --url $CIRCLE_BUILD_URL \
+                      --pr $CIRCLE_PULL_REQUEST \
+                      --workflow $CIRCLE_WORKFLOW_ID \
+                      --sha $CIRCLE_SHA1 \
+                      --job $CIRCLE_JOB \
+                      --asset-endpoint https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com
+            - run:
+                name: Get known flaky tests for future retries
+                command: |
+                    bin/retry.sh bin/getKnownFlakyTests.sh >> $HOME/project/knownFlakyTests.log
+                    cat $HOME/project/knownFlakyTests.log || exit 0
+            - run:
+                name: Build
+                no_output_timeout: 40m
+                command: |
+                    if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                    node common/scripts/install-run-rush.js test --parallelism 10 --timeline --verbose
+                environment:
+                    CONCURRENCY: 4 # WTR only setting, amount of test files to run concurrently
+                    BROWSERS: "chromium" # force WTR to use only chromium
+                    RUN_COVERAGE: "true"
+            - run:
+                <<: *postrun
+            - run:
+                name: Cover
+                command: |
+                    if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                    node common/scripts/install-run-rush.js cover --verbose
+            - run:
+                name: Merge unit test code coverage
+                command: |
+                    tools/build/scripts/move-wtr-reports.js
+                    tools/test/src/scripts/merge-reports.js
+            - store_test_results:
+                path: output/test
+            - run:
+                <<: *copy_rush_logs
+            - run:
+                name: Publish test and coverage results
+                when: always
+                command: |
+                    tools/ci/publishArtifacts.js \
+                      --branch $CIRCLE_BRANCH \
+                      --build-num $CIRCLE_BUILD_NUM \
+                      --source output \
+                      --match rush-logs/**,test/**,test-results/**,coverage-typescript/**,coverage-cpp/**,coverage-wtr/** \
+                      --url $CIRCLE_BUILD_URL \
+                      --bucket dev-te-build-artifacts
+            # PR Comment for Build
+            - run:
+                name: Pull Request Comment (build)
+                when: always
+                command: |
+                    tools/ci/comments/unitTestComment.js \
+                      --build \
+                      --branch $CIRCLE_BRANCH \
+                      --build-num $CIRCLE_BUILD_NUM \
+                      --token $GH_AUTH_TOKEN \
+                      --url $CIRCLE_BUILD_URL \
+                      --pr $CIRCLE_PULL_REQUEST \
+                      --workflow $CIRCLE_WORKFLOW_ID \
+                      --sha $CIRCLE_SHA1 \
+                      --job $CIRCLE_JOB \
+                      --asset-endpoint https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com
+            # PR Comment for Tests
+            - run:
+                name: Pull Request Comment (complete)
+                when: always
+                command: |
+                    tools/ci/comments/unitTestComment.js \
+                      --complete \
+                      --branch $CIRCLE_BRANCH \
+                      --build-num $CIRCLE_BUILD_NUM \
+                      --token $GH_AUTH_TOKEN \
+                      --url $CIRCLE_BUILD_URL \
+                      --pr $CIRCLE_PULL_REQUEST \
+                      --workflow $CIRCLE_WORKFLOW_ID \
+                      --sha $CIRCLE_SHA1 \
+                      --job $CIRCLE_JOB \
+                      --asset-endpoint https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com
+
+    rush_integration_test_commands:
+        steps:
+            - run:
+                name: Patch rush
+                no_output_timeout: 5m
+                command:
+                  tools/ci/patchRush.js
+
+            - run:
+                name: Build
+                no_output_timeout: 30m
+                command: |
+                    if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                    node common/scripts/install-run-rush.js build:release --parallelism 14 --timeline --verbose
+            - run:
+                name: Get known flaky tests for future retries
+                command: |
+                    bin/retry.sh bin/getKnownFlakyTests.sh >> $HOME/project/knownFlakyTests.log
+                    cat $HOME/project/knownFlakyTests.log || exit 0
+            # Integration Test
+            - run:
+                name: Integration Tests
+                no_output_timeout: 30m
+                command: |
+                    if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                    node common/scripts/install-run-rush.js test:integration --verbose --parallelism 8 --verbose
+            - store_test_results:
+                path: output/test
+            - run:
+                <<: *copy_rush_logs
+            - run:
+                name: Publish logs to gh-pages
+                when: always
+                command: |
+                    CACHE_DIR=output/gh-pages tools/ci/publishArtifacts.js --branch $CIRCLE_BRANCH --build-num $CIRCLE_BUILD_NUM --url $CIRCLE_BUILD_URL --source output --match rush-logs/**,coverage-wtr/** --bucket dev-te-build-artifacts
+            - run:
+                name: Publish results to Artifactory
+                when: always
+                command: |
+                    if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                    tools/ci/pushToArtifactory.js \
+                      --artifactory-repo https://artifactory-uw2.testitc.com/artifactory/generic-tester-release/IntegrationTest \
+                      --artifactory-key $ARTIFACTORY_CLOUD_API_KEY \
+                      --sha $CIRCLE_SHA1 \
+                      --results-folder output/test/
+
+    pr_smoke_test_commands:
+        steps:
+            - run:
+                name: Pull Request Comment (clean)
+                when: always
+                command: |
+                    tools/ci/comments/e2e/projectXE2EComment.js \
+                      --clean \
+                      --branch $CIRCLE_BRANCH \
+                      --build-num $CIRCLE_BUILD_NUM \
+                      --token $GH_AUTH_TOKEN \
+                      --url $CIRCLE_BUILD_URL \
+                      --pr $CIRCLE_PULL_REQUEST \
+                      --workflow $CIRCLE_WORKFLOW_ID \
+                      --sha $CIRCLE_SHA1 \
+                      --job $CIRCLE_JOB \
+                      --asset-endpoint https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com
+            - run:
+                name: Pull Request Comment (build)
+                when: always
+                command: |
+                    tools/ci/comments/e2e/projectXE2EComment.js \
+                      --build \
+                      --branch $CIRCLE_BRANCH \
+                      --build-num $CIRCLE_BUILD_NUM \
+                      --token $GH_AUTH_TOKEN \
+                      --url $CIRCLE_BUILD_URL \
+                      --pr $CIRCLE_PULL_REQUEST \
+                      --workflow $CIRCLE_WORKFLOW_ID \
+                      --sha $CIRCLE_SHA1 \
+                      --job $CIRCLE_JOB \
+                      --asset-endpoint https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com
+            - run:
+                name: Get known flaky tests for future retries
+                command: |
+                    bin/retry.sh bin/getKnownFlakyTests.sh >> $HOME/project/knownFlakyTests.log
+                    cat $HOME/project/knownFlakyTests.log || exit 0
+            # Deploy prenv script has ballooned, this is just temporary
+            # The deployment will continue to be serial and run rush-escape
+            - run:
+                name: Deploy PR ENV
+                no_output_timeout: 30m
+                command: |
+                    if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                    export OUTPUT_DIR="$(pwd)/output/pr-smoke/deploy-prenv"
+                    bazel run //infra/cicd/cmd/deploy_prenv:deploy_prenv --verbose_failures -- --cicd_env $CICD_ENV
+                environment:
+                  NO_COMMENT: "true"
+                  WAIT_FOR_DEPLOYMENTS: "true"
+                  DEPLOY_X: "true"
+                  DEPLOY_QA: "true"
+            # Smoke Test
+            - run:
+                name: Run smoke tests
+                no_output_timeout: 30m
+                command: |
+                    if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                    if [ "$CIRCLE_BRANCH" == "main" ]; then
+                      node common/scripts/install-run-rush.js test:pr-smoke -v --to @te/project-x-e2e-test
+                    else
+                      node common/scripts/install-run-rush.js test:pr-smoke --verbose
+                    fi
+            - run:
+                name: Publish test results to gh-pages
+                when: always
+                command: |
+                    if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                    CACHE_DIR=output/gh-pages tools/ci/publishArtifacts.js \
+                      --branch $CIRCLE_BRANCH \
+                      --build-num $CIRCLE_BUILD_NUM \
+                      --source output \
+                      --match "test/**/*" \
+                      --url $CIRCLE_BUILD_URL \
+                      --bucket dev-te-build-artifacts
+            - store_test_results:
+                path: output/test
+            - run:
+                name: Pull Request Comment (complete)
+                when: always
+                command: |
+                    tools/ci/comments/e2e/projectXE2EComment.js \
+                      --complete \
+                      --branch $CIRCLE_BRANCH \
+                      --build-num $CIRCLE_BUILD_NUM \
+                      --token $GH_AUTH_TOKEN \
+                      --url $CIRCLE_BUILD_URL \
+                      --pr $CIRCLE_PULL_REQUEST \
+                      --workflow $CIRCLE_WORKFLOW_ID \
+                      --sha $CIRCLE_SHA1 \
+                      --job $CIRCLE_JOB \
+                      --asset-endpoint https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com
+
+    main_workflow_test_commands:
+        steps:
+            - run:
+                name: Pull Request Comment (clean)
+                when: always
+                command: |
+                    tools/ci/comments/e2e/projectXE2EComment.js \
+                      --clean \
+                      --branch $CIRCLE_BRANCH \
+                      --build-num $CIRCLE_BUILD_NUM \
+                      --token $GH_AUTH_TOKEN \
+                      --url $CIRCLE_BUILD_URL \
+                      --pr $CIRCLE_PULL_REQUEST \
+                      --workflow $CIRCLE_WORKFLOW_ID \
+                      --sha $CIRCLE_SHA1 \
+                      --job $CIRCLE_JOB \
+                      --asset-endpoint https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com
+            - run:
+                name: Pull Request Comment (build)
+                when: always
+                command: |
+                    tools/ci/comments/e2e/projectXE2EComment.js \
+                      --build \
+                      --branch $CIRCLE_BRANCH \
+                      --build-num $CIRCLE_BUILD_NUM \
+                      --token $GH_AUTH_TOKEN \
+                      --url $CIRCLE_BUILD_URL \
+                      --pr $CIRCLE_PULL_REQUEST \
+                      --workflow $CIRCLE_WORKFLOW_ID \
+                      --sha $CIRCLE_SHA1 \
+                      --job $CIRCLE_JOB \
+                      --asset-endpoint https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com
+            - run:
+                name: Get known flaky tests for future retries
+                command: |
+                    bin/retry.sh bin/getKnownFlakyTests.sh >> $HOME/project/knownFlakyTests.log
+                    cat $HOME/project/knownFlakyTests.log || exit 0
+            - run:
+                name: Deploy PR ENV
+                no_output_timeout: 30m
+                command: |
+                    if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                    export OUTPUT_DIR="$(pwd)/output/main-workflow/deploy-prenv"
+                    bazel run //infra/cicd/cmd/deploy_prenv:deploy_prenv --verbose_failures -- --cicd_env $CICD_ENV
+                environment:
+                  NO_COMMENT: "true"
+                  WAIT_FOR_DEPLOYMENTS: "true"
+                  DEPLOY_X: "true"
+                  DEPLOY_QA: "true"
+            # Run tests for main quality checkpoint
+            - run:
+                name: Run workflow tests
+                no_output_timeout: 30m
+                command: |
+                    if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                    node common/scripts/install-run-rush.js test:main-workflow --parallelism 5 --verbose
+            - run:
+                name: Publish test results to gh-pages
+                when: always
+                command: |
+                    if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                    CACHE_DIR=output/gh-pages tools/ci/publishArtifacts.js \
+                      --branch $CIRCLE_BRANCH \
+                      --build-num $CIRCLE_BUILD_NUM \
+                      --source output \
+                      --match "test/**/*" \
+                      --url $CIRCLE_BUILD_URL \
+                      --bucket dev-te-build-artifacts
+            - store_test_results:
+                path: output/test
+            - run:
+                name: Pull Request Comment (complete)
+                when: always
+                command: |
+                    tools/ci/comments/e2e/projectXE2EComment.js \
+                      --complete \
+                      --branch $CIRCLE_BRANCH \
+                      --build-num $CIRCLE_BUILD_NUM \
+                      --token $GH_AUTH_TOKEN \
+                      --url $CIRCLE_BUILD_URL \
+                      --pr $CIRCLE_PULL_REQUEST \
+                      --workflow $CIRCLE_WORKFLOW_ID \
+                      --sha $CIRCLE_SHA1 \
+                      --job $CIRCLE_JOB \
+                      --asset-endpoint https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com
+    chunk_check_commands:
+      steps:
+          - run:
+              name: Set Artifactory Credentials
+              command: |
+                echo "$ARTIFACTORY_CLOUD_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-tester-snapshot.dr-uw2.testitc.com
+                echo "$ARTIFACTORY_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-hub-remote.dr.corp.test.com
+                bazel run //infra/cicd/cmd/set_sys_credentials:set_credentials
+          - run:
+              name: Build
+              no_output_timeout: 30m
+              command: |
+                  if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                  node common/scripts/install-run-rush.js build:release --to @te/project-x --parallelism 14 --timeline --verbose
+          - run:
+              name: Pull Request Comment (clean)
+              when: always
+              command: |
+                  if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                  tools/ci/comments/chunkCheckComment.js \
+                    --clean \
+                    --branch $CIRCLE_BRANCH \
+                    --build-num $CIRCLE_BUILD_NUM \
+                    --token $GH_AUTH_TOKEN \
+                    --url $CIRCLE_BUILD_URL \
+                    --pr $CIRCLE_PULL_REQUEST \
+                    --workflow $CIRCLE_WORKFLOW_ID \
+                    --sha $CIRCLE_SHA1 \
+                    --job $CIRCLE_JOB \
+                    --asset-endpoint https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com \
+                    --results-folder ../../apps/output/chunk-check
+          - run:
+              name: Performance Tests - Chunk Check
+              command: |
+                  if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                  git config extensions.partialClone origin
+                  git fetch --force --filter=blob:none --no-tags origin +refs/heads/main:refs/remotes/origin/main
+                  node common/scripts/install-run-rush.js test:performance:chunk-check --verbose
+          - run:
+              name: Upload results to Artifactory
+              # Ensure we retain raw results even if report generation failed
+              command: |
+                  if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                  tools/ci/pushToArtifactory.js \
+                    --artifactory-repo https://artifactory-uw2.testitc.com/artifactory/generic-tester-release/chunk-check \
+                    --artifactory-key $ARTIFACTORY_CLOUD_API_KEY \
+                    --sha $CIRCLE_SHA1 \
+                    --results-folder apps/output/chunk-check
+          - run:
+              name: Generate report and override as needed
+              when: always
+              command: |
+                  if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                  tools/chunk-check/bin/chunk-check-overrider.js \
+                    --pr "${CIRCLE_PULL_REQUEST:-undefined}" \
+                    --report https://artifactory-uw2.testitc.com/artifactory/generic-tester-release/chunk-check/$CIRCLE_SHA1/report.html \
+                    --override-folder platform/common/performance/config \
+                    --results-folder apps/output/chunk-check
+          - run:
+              name: Upload report to Artifactory
+              when: always
+              command: |
+                  if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                  tools/ci/pushToArtifactory.js \
+                    --artifactory-repo https://artifactory-uw2.testitc.com/artifactory/generic-tester-release/chunk-check \
+                    --artifactory-key $ARTIFACTORY_CLOUD_API_KEY \
+                    --sha $CIRCLE_SHA1 \
+                    --results-folder apps/output/chunk-check
+          - run:
+              name: Pull Request Comment (complete)
+              when: always
+              command: |
+                  if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                  tools/ci/comments/chunkCheckComment.js \
+                    --complete \
+                    --branch $CIRCLE_BRANCH \
+                    --build-num $CIRCLE_BUILD_NUM \
+                    --token $GH_AUTH_TOKEN \
+                    --url $CIRCLE_BUILD_URL \
+                    --pr $CIRCLE_PULL_REQUEST \
+                    --workflow $CIRCLE_WORKFLOW_ID \
+                    --sha $CIRCLE_SHA1 \
+                    --job $CIRCLE_JOB \
+                    --asset-endpoint https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com \
+                    --results-folder ../../apps/output/chunk-check
+          - run:
+              <<: *copy_rush_logs
+
+    finish_steps_commands:
+        parameters:
+            main_alert_channel:
+                default: "te-cicd-alert"
+                type: string
+        steps:
+            # TODO: maybe add other information of tests/packages that fail
+            - run:
+                name: Get rush stderr logs
+                description: Save log files of commands which had warnings or errors for easier debugging
+                when: on_fail
+                command: |
+                    if [ -d output/rush-logs ]; then
+                      if [ ! -d output/rush-stderr-logs ]; then
+                        mkdir output/rush-stderr-logs
+                      fi
+                      find output/rush-logs -type f -name "*.error.log" -exec cp -v {} output/rush-stderr-logs/ \;
+                    fi
+            - run:
+                name: Check Disk Size for [CCEX-27710]
+                when: on_fail
+                command: df -h
+            - store_artifacts:
+                path: output/rush-stderr-logs
+            - run:
+                <<: *push_stats_to_prometheus
+            - slack/notify:
+                <<: *slack-failure-notify
+            - slack/notify:
+                <<: *slack-main-branch-failure-notify
+
+parameters:
+  merge_main:
+    description: Run merge_main workflow.
+    type: boolean
+    default: false
+
+  merge_main_branch:
+    description: The upstream branch used in merge_main job. This parameter is used for testing purposes only.
+    type: string
+    default: "main"
+
+  merge_main_dry_run:
+    description: Execute merge_main workflow, but do not push the changes to the upstream.
+    type: boolean
+    default: false
+
+  des_load_test:
+    description: Execute des load test or not
+    type: boolean
+    default: false
+
+  des_load_test_cleanup:
+    description: Clean up load test resources
+    type: boolean
+    default: false
+
+  des_load_test_build:
+    description: Build load test
+    type: boolean
+    default: false
+
 jobs:
-  say-hello:
-    # Specify the execution environment. You can specify an image from Docker Hub or use one of our convenience images from CircleCI's Developer Hub.
-    # See: https://circleci.com/docs/configuration-reference/#executor-job
-    docker:
-      - image: cimg/base:stable
-    # Add steps to the job
-    # See: https://circleci.com/docs/configuration-reference/#steps
+  build_docker_cache_image:
+    machine:
+      enabled: true
+      docker_layer_caching: false
+    parameters:
+      main_alert_channel:
+        type: string
+        default: "te-cicd-alert"
+    resource_class: 2xlarge
     steps:
       - checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          name: Build Cacher Image
+          no_output_timeout: 2h
+          command: |
+            export NODE_OPTIONS="$NODE_OPTIONS --max-old-space-size=8196"
+            sudo sysctl fs.inotify.max_user_watches=524288
+            echo "$ARTIFACTORY_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-asr-release.dr.corp.test.com
+            echo "$ARTIFACTORY_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-hub-remote.dr.corp.test.com
+            echo "$ARTIFACTORY_CLOUD_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-tester-snapshot.dr-uw2.testitc.com
+            echo "$ARTIFACTORY_CLOUD_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-ethos-release.dr-uw2.testitc.com
+            echo "$ARTIFACTORY_SENSEI_FLEX_API_KEY" | docker login --username "$ARTIFACTORY_SENSEI_FLEX_USER" --password-stdin docker-sensei-ethos-flex-release.dr-uw2.testitc.com
+            echo "$ARTIFACTORY_CLOUD_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-asr-release.dr-uw2.testitc.com
+
+            BASE_IMAGE=$(grep -F "FROM " .circleci/Dockerfile.cacher | cut -d' ' -f2)
+            if ! docker image pull "${BASE_IMAGE}" >/dev/null 2>&1; then
+              docker build \
+                -f .circleci/Dockerfile.base \
+                -t  "${BASE_IMAGE}" \
+                .circleci
+              docker push "${BASE_IMAGE}"
+            fi
+
+            export DOCKER_BUILDKIT=1
+            docker build \
+              -f .circleci/Dockerfile.cacher \
+              -t docker-tester-snapshot.dr-uw2.testitc.com/discoverycache:latest \
+              .circleci \
+              --ssh default="${HOME}/.ssh/id_rsa_0d6e1bcf932803fea44f96eadf03053d" \
+              --secret id=artifactory_user,env=ARTIFACTORY_USER \
+              --secret id=artifactory_api_key,env=ARTIFACTORY_API_KEY \
+              --secret id=artifactory_cloud_api_key,env=ARTIFACTORY_CLOUD_API_KEY \
+              --secret id=artifactory_sensei_flex_api_key,env=ARTIFACTORY_SENSEI_FLEX_API_KEY \
+              --secret id=artifactory_sensei_flex_user,env=ARTIFACTORY_SENSEI_FLEX_USER \
+              --secret id=rush_build_cache_credential,env=RUSH_BUILD_CACHE_CREDENTIAL \
+              --secret id=gh_auth_token,env=GH_AUTH_TOKEN \
+              --build-arg CIRCLE_BRANCH=${CIRCLE_BRANCH} \
+              --build-arg CIRCLE_SHA1=${CIRCLE_SHA1} \
+              --build-arg CACHEBUST=$(date +%s) \
+
+            docker push docker-tester-snapshot.dr-uw2.testitc.com/discoverycache:latest
+      - run:
+          name: Tag image with date and next seq. number
+          command: |
+            DATE_TAG=$(date +"%Y%m%d")
+            SEQ_NUM=01
+            REGISTRY=docker-tester-snapshot.dr-uw2.testitc.com
+
+            # find unused SEQ_NUM
+            set +e
+            while [[ $SEQ_NUM -lt 99 ]]; do
+              echo "Checking seq number: $SEQ_NUM in docker-registry"
+              docker manifest inspect $REGISTRY/discoverycache:v$DATE_TAG$SEQ_NUM
+              if [ $? -eq 1 ]; then
+                  echo "seq number: $SEQ_NUM is available"
+                  break
+              fi
+              ((SEQ_NUM++))
+              SEQ_NUM=$(printf "%02d" $SEQ_NUM)
+            done
+            set -e
+
+            docker tag $REGISTRY/discoverycache:latest $REGISTRY/discoverycache:v$DATE_TAG$SEQ_NUM
+            docker push $REGISTRY/discoverycache:v$DATE_TAG$SEQ_NUM
+
+      - run:
+          <<: *docker_list_images
+
+      - slack/notify:
+          <<: *slack-main-branch-failure-notify
+
+  test_docker_cache_image:
+    machine:
+      enabled: true
+      docker_layer_caching: false
+    resource_class: 2xlarge
+    steps:
+      - checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          name: System Setup
+          command: |
+            sudo sysctl fs.inotify.max_user_watches=524288
+
+      - run:
+          name: Docker Login
+          command: |
+            echo "$ARTIFACTORY_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-asr-release.dr.corp.test.com
+            echo "$ARTIFACTORY_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-hub-remote.dr.corp.test.com
+            echo "$ARTIFACTORY_CLOUD_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-tester-snapshot.dr-uw2.testitc.com
+
+      - run:
+          <<: *docker_list_images
+
+      - run:
+          name: Build Base Image
+          no_output_timeout: 30m
+          command: |
+            BASE_IMAGE=$(grep -F "FROM " .circleci/Dockerfile.cacher | cut -d' ' -f2)
+            if ! docker image pull "${BASE_IMAGE}" >/dev/null 2>&1; then
+              docker build \
+                -f .circleci/Dockerfile.base \
+                -t  "${BASE_IMAGE}" \
+                .circleci
+              docker push "${BASE_IMAGE}"
+            else
+              echo "Base image already exists: ${BASE_IMAGE}"
+            fi
+
+      - run:
+          name: Build Cacher Image
+          no_output_timeout: 30m
+          command: |
+            export DOCKER_BUILDKIT=1
+            docker build \
+            -f .circleci/Dockerfile.cacher \
+            -t docker-tester-snapshot.dr-uw2.testitc.com/discoverycache:test \
+            .circleci \
+            --ssh default="${HOME}/.ssh/id_rsa_0d6e1bcf932803fea44f96eadf03053d" \
+            --secret id=artifactory_user,env=ARTIFACTORY_USER \
+            --secret id=artifactory_api_key,env=ARTIFACTORY_API_KEY \
+            --secret id=artifactory_cloud_api_key,env=ARTIFACTORY_CLOUD_API_KEY \
+            --secret id=artifactory_sensei_flex_api_key,env=ARTIFACTORY_SENSEI_FLEX_API_KEY \
+            --secret id=artifactory_sensei_flex_user,env=ARTIFACTORY_SENSEI_FLEX_USER \
+            --secret id=rush_build_cache_credential,env=RUSH_BUILD_CACHE_CREDENTIAL \
+            --secret id=gh_auth_token,env=GH_AUTH_TOKEN \
+            --build-arg CIRCLE_BRANCH=${CIRCLE_BRANCH} \
+            --build-arg CIRCLE_SHA1=${CIRCLE_SHA1} \
+            --build-arg CACHEBUST=$(date +%s) \
+
+      - run:
+          name: Tag Image
+          command: |
+            DATE_TAG=$(date +"%Y%m%d")
+            SEQ_NUM=01
+            REGISTRY=docker-tester-snapshot.dr-uw2.testitc.com
+
+            # find unused SEQ_NUM
+            set +e
+            while [[ $SEQ_NUM -lt 99 ]]; do
+              echo "Checking seq number: $SEQ_NUM in docker-registry"
+              docker manifest inspect $REGISTRY/discoverycache:test-v$DATE_TAG$SEQ_NUM
+              if [ $? -ne 0 ]; then
+                  echo "seq number: $SEQ_NUM is available"
+                  break
+              fi
+              ((SEQ_NUM++))
+              SEQ_NUM=$(printf "%02d" $SEQ_NUM)
+            done
+            set -e
+
+            docker tag $REGISTRY/discoverycache:test $REGISTRY/discoverycache:test-v$DATE_TAG$SEQ_NUM
+            docker push $REGISTRY/discoverycache:test
+            docker push $REGISTRY/discoverycache:test-v$DATE_TAG$SEQ_NUM
+
+            echo "Docker image tag created:"
+            echo $REGISTRY/discoverycache:test-v$DATE_TAG$SEQ_NUM
+
+            # For custom test tag version, uncomment and modify
+            # docker tag $REGISTRY/discoverycache:test-<username>
+            # docker push $REGISTRY/discoverycache:test-<username>
+
+      - run:
+          <<: *docker_list_images
+
+  merge_main:
+    <<: *docker_default
+    resource_class: small
+    steps:
+      - when:
+          condition:
+              not: << pipeline.parameters.merge_main >>
+          steps:
+            - run:
+                name: Stop if the merge_main parameter is not set
+                command: circleci-agent step halt
+      - run:
+          <<: *te_checkout
+      - add_ssh_keys:
+          <<: *writable_github_ssh_key
+      - run:
+          <<: *git_config
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Merge latest << pipeline.parameters.merge_main_branch >>
+          command: |
+              node tools/ci/rushUpdateOnBranch.js \
+                --remote origin \
+                --remoteBranch << pipeline.parameters.merge_main_branch >> \
+                --branch $CIRCLE_BRANCH \
+                --dry-run << pipeline.parameters.merge_main_dry_run >>
+      - run:
+          <<: *push_stats_to_prometheus
+
+  runner_rush_build_debug_and_unit_test:
+      parameters:
+        cache_enabled:
+          type: boolean
+          default: true
+        main_alert_channel:
+          type: string
+          default: "te-runner-alert"
+        resource_class:
+          type: string
+          default: "ns_tester/rc_cicd_ccc_stage"
+      machine: true
+      resource_class: << parameters.resource_class >>
+      steps:
+          - rush_build_bootstrap_commands_for_runners
+          - when:
+              condition:
+                not: << parameters.cache_enabled >>
+              steps:
+                - run:
+                    name: Delete Cache Config
+                    command: rm common/config/rush/build-cache.json
+          - rush_build_debug_and_unit_test_commands
+          - finish_steps_commands:
+              main_alert_channel: << parameters.main_alert_channel >>
+
+  runner_rush_build_and_test:
+    parameters:
+      cache_enabled:
+        type: boolean
+        default: true
+      main_alert_channel:
+        type: string
+        default: "te-runner-alert"
+      resource_class:
+        type: string
+        default: "ns_tester/rc_cicd_ccc_stage"
+    machine: true
+    resource_class: << parameters.resource_class >>
+    steps:
+      - rush_build_bootstrap_commands_for_runners
+      - when:
+          condition:
+            not: << parameters.cache_enabled >>
+          steps:
+            - run:
+                name: Delete Cache Config
+                command: rm common/config/rush/build-cache.json
+      - rush_build_and_test_commands
+      - finish_steps_commands:
+          main_alert_channel: << parameters.main_alert_channel >>
+
+  video_export_integration_tests:
+    machine: true
+    resource_class: ns_tester/rc_tester_ssre
+    steps:
+      - rush_build_bootstrap_commands
+      - run:
+          name: Build
+          no_output_timeout: 30m
+          command: |
+              if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+              node common/scripts/install-run-rush.js build:release --to @te/headless-renderer --parallelism 14 --timeline --verbose
+              node common/scripts/install-run-rush.js build:release --to-except @te/video-export-engine --timeline --verbose
+              node common/scripts/install-run-rush.js build:cpf --only @te/video-export-engine -v
+      # Integration Test
+      - run:
+          name: VEO Tests
+          no_output_timeout: 30m
+          command: |
+              if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+              cd services/cpf/video-export-engine;LD_LIBRARY_PATH=/home/asruser/project/services/cpf/video-export-engine/dist/cuda/lib:/home/asruser/project/services/cpf/video-export-engine/dist/ffmpeg/lib:/home/asruser/project/services/cpf/video-export-engine/dist/av-processor/lib:/home/asruser/project/services/cpf/video-export-engine/dist/prores/lib:/usr/lib/x86_64-linux-gnu:/usr/lib/i386-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64 ENABLE_VIDEO=true C2PA_LIBRARY_PATH=/home/asruser/project/services/cpf/video-export-engine/dist/c2pa.node scripts/integrationtest.sh
+      - store_test_results:
+          path: output/test
+      - run:
+          <<: *copy_rush_logs
+      - slack/notify:
+          channel: te-automation-all-tests-results
+          event: pass
+          <<: *slack-success-notify
+      - slack/notify:
+          channel: te-server-side-rendering-and-interop
+          event: fail
+          <<: *slack-failure-notify-template
+
+  runner_rush_integration_test:
+    parameters:
+      cache_enabled:
+        type: boolean
+        default: true
+      main_alert_channel:
+        type: string
+        default: "te-runner-alert"
+      resource_class:
+        type: string
+        default: "ns_tester/rc_cicd_ccc_stage"
+    machine: true
+    resource_class: << parameters.resource_class >>
+    steps:
+      - rush_build_bootstrap_commands_for_runners
+      - when:
+          condition:
+            not: << parameters.cache_enabled >>
+          steps:
+            - run:
+                name: Delete Cache Config
+                command: rm common/config/rush/build-cache.json
+      - rush_integration_test_commands
+      - finish_steps_commands:
+          main_alert_channel: << parameters.main_alert_channel >>
+
+  bazel_build_and_test:
+    <<: *docker_default
+    parameters:
+      main_alert_channel:
+        type: string
+        default: "te-cicd-alert"
+    resource_class: large
+    steps:
+      - run:
+          <<: *skip-if-ignore-matches
+      - run:
+          <<: *te_checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *git_config
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          # The default bashrc bails on non-interactive terminals. Reset it so
+          # we can add Emscripten env to it
+          name: Reset .bashrc
+          command: echo "" > $HOME/.bashrc
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Set Credentials
+          command: |
+            echo "$ARTIFACTORY_CLOUD_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-tester-snapshot.dr-uw2.testitc.com
+            echo "$ARTIFACTORY_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-hub-remote.dr.corp.test.com
+            bazel run //infra/cicd/cmd/set_sys_credentials:set_credentials
+      - run:
+          name: Lint
+          command: bazel run //:buildifier.check
+      - run:
+          name: Build
+          command: |
+            bazel build -- //apps/deployments/... //infra/...
+      - run:
+          name: Test
+          command: |
+            bazel test -- //apps/deployments/... //infra/...
+      # TODO: figure out why just "path: bazel-testlogs" doesn't work
+      - store_test_results:
+          path: bazel-testlogs/apps/deployments
+      - store_test_results:
+          path: bazel-testlogs/infra
+      - run:
+          <<: *push_stats_to_prometheus
+      - slack/notify:
+          <<: *slack-failure-notify
+      - slack/notify:
+          <<: *slack-main-branch-failure-notify
+
+  cpf_build_and_test:
+    <<: *docker_default
+    resource_class: 2xlarge
+    steps:
+      - rush_build_bootstrap_commands
+      - run:
+          name: Build
+          command: |
+            if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+            node common/scripts/install-run-rush.js build:release --parallelism 8 --timeline
+            node common/scripts/install-run-rush.js build:cpf --parallelism 8 --timeline --verbose
+      - finish_steps_commands
+
+  runner_cpf_build_and_test:
+    parameters:
+      main_alert_channel:
+        type: string
+        default: "te-runner-alert"
+      resource_class:
+        type: string
+        default: "ns_tester/rc_cicd_ccc_stage"
+    machine: true
+    resource_class: << parameters.resource_class >>
+    steps:
+      - rush_build_bootstrap_commands_for_runners
+      - run:
+          name: Build
+          command: |
+            if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+            node common/scripts/install-run-rush.js build:release --parallelism 8 --timeline
+            node common/scripts/install-run-rush.js build:cpf --parallelism 8 --timeline --verbose
+      - finish_steps_commands
+
+  clean_artifacts:
+    <<: *docker_default
+    resource_class: small
+    steps:
+      - run:
+          <<: *te_checkout
+
+      - add_ssh_keys:
+          <<: *writable_github_ssh_key
+
+      - run:
+          <<: *git_config
+
+      - run:
+          <<: *netrc_config
+
+      - run:
+          <<: *npmrc_config
+
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+
+      - run:
+          name: "Clean old gh-pages build artifacts"
+          command: |
+              CACHE_DIR=output/gh-pages tools/ci/cleanArtifacts.js --token $GH_AUTH_TOKEN --days 1
+
+      - run:
+          <<: *push_stats_to_prometheus
+
+  scan_sonarqube:
+    <<: *docker_default
+    parameters:
+      main_alert_channel:
+        type: string
+        default: "te-cicd-alert"
+    resource_class: xlarge
+    steps:
+        - run:
+            <<: *te_checkout
+        - run:
+            <<: *netrc_config
+        - run:
+            <<: *npmrc_config
+        - run:
+            name: Install dependencies
+            command: node common/scripts/install-run-rush.js install
+        - run:
+            <<: *prerun
+        - run:
+            # Build the specs-extractor package that is used by the analytics validator
+            name: Build
+            command: |
+                if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                node common/scripts/install-run-rush.js build --to @te/specs-extractor --parallelism 14 --timeline
+        - run:
+            # Runs the analytics validator before the sonar scan to generate external issues report from the validator
+            name: Run Analytics Validator
+            command: |
+                if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+                /bin/bash tools/specs-extractor/src/analytics/scripts/runner.sh
+        - run:
+              name: Sonar scan
+              command: |
+                  export LC_ALL="en_US.UTF-8"
+                  export LANG="en_US.UTF-8"
+                  export LANGUAGE="en_US.UTF-8​"
+                  export JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8 -Dsun.io.unicode.encoding=UnicodeLittle -DLC_CTYPE=UTF-8"
+                  export JAVA_OPTS="-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8 -Dsun.io.unicode.encoding=UnicodeLittle -DLC_CTYPE=UTF-8"
+                  export M2_HOME=/usr/share/maven/
+                  node tools/sonarqube-scanner/scripts/sonarScan.js \
+                    --branch $CIRCLE_BRANCH \
+                    --pr $CIRCLE_PULL_REQUEST \
+                    --sha $CIRCLE_SHA1
+        - run:
+            <<: *push_stats_to_prometheus
+        - slack/notify:
+            <<: *slack-failure-notify
+        - slack/notify:
+            <<: *slack-main-branch-failure-notify
+
+  create_sonarqube_tickets:
+    <<: *docker_default
+    resource_class: small
+    steps:
+        - run:
+            <<: *te_checkout
+        - run:
+            <<: *netrc_config
+        - run:
+            name: Install dependencies
+            command: node common/scripts/install-run-rush.js install
+        - run:
+            <<: *prerun
+        - run:
+              name: Create Jira Tickets for SQ Bugs
+              command: node tools/sonarqube-scanner/scripts/createJiraBugs.js
+        - run:
+            <<: *push_stats_to_prometheus
+
+  deploy_stage:
+    <<: *docker_default
+    resource_class: 2xlarge
+    steps:
+      - checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Deploy stage ENV
+          command: bazel run //infra/cicd/cmd/deploy_stage:deploy_stage -- --cicd_env $CICD_ENV
+          no_output_timeout: 30m
+      - run:
+          <<: *push_stats_to_prometheus
+
+  deploy_stage_projectx:
+    <<: *docker_default
+    resource_class: 2xlarge
+    steps:
+      - checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Deploy stage ENV
+          command: bazel run //infra/cicd/cmd/deploy_stage:deploy_stage_projectx -- \
+                --cicd_env $CICD_ENV \
+                --instance stage
+          no_output_timeout: 30m
+      - run:
+          <<: *push_stats_to_prometheus
+
+  deploy_projectx_stage_daily:
+    <<: *docker_default
+    resource_class: 2xlarge
+    steps:
+      - checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Deploy stage daily ENV
+          command: bazel run //infra/cicd/cmd/deploy_stage:deploy_stage_projectx -- \
+                --cicd_env $CICD_ENV \
+                --instance stage-daily
+          no_output_timeout: 30m
+      - run:
+          <<: *push_stats_to_prometheus
+
+  deploy_quickactions_stage_daily:
+    <<: *docker_default
+    resource_class: xlarge
+    steps:
+      - checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Deploy stage ENV
+          command: bazel run //infra/cicd/cmd/deploy_quickactions_stage:deploy_quickactions_stage -- --cicd_env $CICD_ENV
+          no_output_timeout: 30m
+      - run:
+          <<: *push_stats_to_prometheus
+
+  deploy_prenv:
+    <<: *docker_default
+    parameters:
+      main_alert_channel:
+        type: string
+        default: "te-cicd-alert"
+    resource_class: 2xlarge
+    steps:
+      - run:
+          <<: *skip-if-ignore-matches
+      - run:
+          <<: *te_checkout
+      - run:
+          <<: *check-deploy-pr-env-required-labels
+      - run:
+          name: End the job gracefully if there's NOTHING_TO_DEPLOY
+          command: if [ ! -z $NOTHING_TO_DEPLOY ]; then circleci-agent step halt; fi
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Deploy PR ENV
+          command: |
+            bazel run //infra/cicd/cmd/deploy_prenv:deploy_prenv -- --cicd_env $CICD_ENV
+          no_output_timeout: 30m
+      - run:
+          <<: *push_stats_to_prometheus
+      - slack/notify:
+          <<: *slack-failure-notify
+      - slack/notify:
+          <<: *slack-main-branch-failure-notify
+
+  cleanup_traffic_target:
+    <<: *docker_default
+    resource_class: small
+    parameters:
+      rpms_tenant:
+        type: string
+    steps:
+      - checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          name: Delete traffic targets
+          command: |
+            bazel run //infra/cicd/cmd/rpms/cleanup:cleanup_traffic_target
+          no_output_timeout: 30m
+          environment:
+            RPMS_TENANT: "<< parameters.rpms_tenant >>"
+
+  cleanup_builds:
+    <<: *docker_default
+    resource_class: small
+    parameters:
+      rpms_tenant:
+        type: string
+    steps:
+      - checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          name: Delete builds
+          command: |
+            bazel run //infra/cicd/cmd/rpms/cleanup:cleanup_builds
+          no_output_timeout: 30m
+          environment:
+            RPMS_TENANT: "<< parameters.rpms_tenant >>"
+
+  deploy_prenv_aws:
+    <<: *docker_default
+    parameters:
+      main_alert_channel:
+        type: string
+        default: "te-cicd-alert"
+    resource_class: 2xlarge
+    steps:
+      - run:
+          <<: *skip-if-ignore-matches
+      - run:
+          <<: *te_checkout
+      - run:
+          <<: *check-deploy-pr-env-aws-required-labels
+      - run:
+          name: End the job gracefully if there's NOTHING_TO_DEPLOY_AWS
+          command: if [ ! -z $NOTHING_TO_DEPLOY_AWS ]; then circleci-agent step halt; fi
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Deploy PR ENV
+          command: |
+            bazel run //infra/cicd/cmd/deploy_prenv_aws:deploy_prenv_aws -- --cicd_env $CICD_ENV
+          no_output_timeout: 30m
+      - run:
+          <<: *push_stats_to_prometheus
+      - slack/notify:
+          <<: *slack-failure-notify
+      - slack/notify:
+          <<: *slack-main-branch-failure-notify
+
+  main_perf_test:
+    <<: *docker_default
+    resource_class: large
+    steps:
+      - run:
+          <<: *te_checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          name: Save Workflow ID
+          command: tools/ci/scripts/save-workflow-id.sh
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Run e2e test with wdio and mocha
+          no_output_timeout: 30m
+          command: |
+              # Run tests on browserstack
+              bazel run //infra/cicd/cmd/wdio_main_perf_test -- \
+                --cicd_env $CICD_ENV \
+                --k8s_context ethos53-stage-or2 \
+                --k8s_namespace ns-team-te-ccweb-e2e \
+                --npm_script "test:performance:main" \
+                --browserstack_user $BROWSERSTACK_USERNAME \
+                --browserstack_key $BROWSERSTACK_ACCESS_KEY || true
+      - run:
+          <<: *push_stats_to_prometheus
+
+  chunk_check:
+    <<: *docker_default
+    resource_class: 2xlarge
+    steps:
+      - run:
+          <<: *skip-if-ignore-matches
+      - run:
+          <<: *te_checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          name: Save Workflow ID
+          command: tools/ci/scripts/save-workflow-id.sh
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Patch rush
+          no_output_timeout: 1m
+          command: |
+            tools/ci/patchRush.js
+      - run:
+          <<: *prerun
+      - chunk_check_commands
+      - finish_steps_commands
+
+  runner_chunk_check:
+    parameters:
+      main_alert_channel:
+        type: string
+        default: "te-runner-alert"
+      resource_class:
+        type: string
+        default: "ns_tester/rc_cicd_ccc_stage"
+    machine: true
+    resource_class: << parameters.resource_class >>
+    steps:
+      - rush_build_bootstrap_commands_for_runners
+      - chunk_check_commands
+      - finish_steps_commands
+
+  deploy_stage_aws:
+    <<: *docker_default
+    resource_class: 2xlarge
+    steps:
+      - run:
+          <<: *skip-if-ignore-matches
+      - run:
+          <<: *te_checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          name: Save Workflow ID
+          command: tools/ci/scripts/save-workflow-id.sh
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Patch rush
+          no_output_timeout: 5m
+          command:
+            tools/ci/patchRush.js
+      - run:
+          <<: *prerun
+      - run:
+          name: Set Artifactory Credentials
+          command: |
+            echo "$ARTIFACTORY_CLOUD_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-tester-snapshot.dr-uw2.testitc.com
+            echo "$ARTIFACTORY_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-hub-remote.dr.corp.test.com
+            bazel run //infra/cicd/cmd/set_sys_credentials:set_credentials
+      - run:
+          name: Build
+          no_output_timeout: 30m
+          command: |
+              if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+              node common/scripts/install-run-rush.js build:release --to @te/x-icons --to @te/x-web-components --to @te/squirrel --parallelism 14 --timeline --verbose
+
+      - run:
+          name: Deploy to AWS shared stage
+          command: |
+              if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+              export AWS_ACCESS_KEY_ID=$PROD_TERRAFORM_AWS_KEY
+              export AWS_SECRET_ACCESS_KEY=$PROD_TERRAFORM_AWS_SECRET
+              node common/scripts/install-run-rush.js deploy:stage
+      - run:
+          <<: *copy_rush_logs
+      - finish_steps_commands
+
+
+  pr_perf_test:
+    <<: *docker_default
+    resource_class: xlarge
+    steps:
+      - run:
+          <<: *skip-if-ignore-matches
+      - run:
+          <<: *te_checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          name: Save Workflow ID
+          command: tools/ci/scripts/save-workflow-id.sh
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          <<: *prerun
+      - run:
+          name: Set Artifactory Credentials
+          command: |
+            echo "$ARTIFACTORY_CLOUD_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-tester-snapshot.dr-uw2.testitc.com
+            echo "$ARTIFACTORY_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-hub-remote.dr.corp.test.com
+            bazel run //infra/cicd/cmd/set_sys_credentials:set_credentials
       - run:
           name: Pull Request Comment (clean)
           when: always
           command: |
-              tools/ci/comments/unitest.js \
+              tools/ci/comments/prPerfTestsComment.js \
                 --clean \
                 --branch $CIRCLE_BRANCH \
                 --build-num $CIRCLE_BUILD_NUM \
@@ -28,12 +1710,1416 @@ jobs:
                 --workflow $CIRCLE_WORKFLOW_ID \
                 --sha $CIRCLE_SHA1 \
                 --job $CIRCLE_JOB \
-                --asset-endpoint <placeholder>
-       
+                --asset-endpoint https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com \
+                --results-folder ../../apps/output/perf-tests
+      - run:
+          name: Pull Request Comment (build)
+          when: always
+          command: |
+              tools/ci/comments/prPerfTestsComment.js \
+                --build \
+                --branch $CIRCLE_BRANCH \
+                --build-num $CIRCLE_BUILD_NUM \
+                --token $GH_AUTH_TOKEN \
+                --url $CIRCLE_BUILD_URL \
+                --pr $CIRCLE_PULL_REQUEST \
+                --workflow $CIRCLE_WORKFLOW_ID \
+                --sha $CIRCLE_SHA1 \
+                --job $CIRCLE_JOB \
+                --asset-endpoint https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com \
+                --results-folder ../../apps/output/perf-tests
+      - run:
+          name: Run PR Performance Tests with wdio and mocha
+          no_output_timeout: 30m
+          command: |
+              node common/scripts/install-run-rush.js test:performance:pr --verbose
+      - run:
+          name: Upload results to Artifactory
+          command: |
+              tools/ci/pushToArtifactory.js \
+                --artifactory-repo https://artifactory-uw2.testitc.com/artifactory/generic-tester-release/pr-perf-tests \
+                --artifactory-key $ARTIFACTORY_CLOUD_API_KEY \
+                --sha $CIRCLE_SHA1 \
+                --results-folder apps/output/perf-tests
+      - run:
+          name: Pull Request Comment (complete)
+          when: always
+          command: |
+              tools/ci/comments/prPerfTestsComment.js \
+                --complete \
+                --branch $CIRCLE_BRANCH \
+                --build-num $CIRCLE_BUILD_NUM \
+                --token $GH_AUTH_TOKEN \
+                --url $CIRCLE_BUILD_URL \
+                --pr $CIRCLE_PULL_REQUEST \
+                --workflow $CIRCLE_WORKFLOW_ID \
+                --sha $CIRCLE_SHA1 \
+                --job $CIRCLE_JOB \
+                --asset-endpoint https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com \
+                --results-folder ../../apps/output/perf-tests
 
-# Orchestrate jobs using workflows
-# See: https://circleci.com/docs/configuration-reference/#workflows
+  pr_smoke_test:
+    <<: *docker_default
+    # TODO: move to 'large' if build:release no longer needs huge amount of memory
+    # Revert to `large` when https://jira.corp.test.com/browse/te-26047 gets fixed
+    resource_class: 2xlarge
+    steps:
+      - rush_build_bootstrap_commands
+      - pr_smoke_test_commands
+      - finish_steps_commands
+
+  runner_pr_smoke_test:
+    parameters:
+      main_alert_channel:
+        type: string
+        default: "te-runner-alert"
+      resource_class:
+        type: string
+        default: "ns_tester/rc_cicd_ccc_stage"
+    machine: true
+    resource_class: << parameters.resource_class >>
+    steps:
+      - rush_build_bootstrap_commands_for_runners
+      - pr_smoke_test_commands
+      - finish_steps_commands:
+          main_alert_channel: << parameters.main_alert_channel >>
+
+  main_workflow_test:
+    <<: *docker_default
+    resource_class: 2xlarge
+    steps:
+      - rush_build_bootstrap_commands
+      - main_workflow_test_commands
+      - finish_steps_commands
+
+  runner_main_workflow_test:
+    parameters:
+      main_alert_channel:
+        type: string
+        default: "te-runner-alert"
+      resource_class:
+        type: string
+        default: "ns_tester/rc_cicd_ccc_stage"
+    machine: true
+    resource_class: << parameters.resource_class >>
+    steps:
+      - rush_build_bootstrap_commands_for_runners
+      - main_workflow_test_commands
+      - finish_steps_commands:
+          main_alert_channel: << parameters.main_alert_channel >>
+
+  playwright_e2e_tests:
+    <<: *docker_default
+    resource_class: 2xlarge
+    steps:
+      - run:
+          <<: *te_checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Get known flaky tests for future retries
+          command: |
+              bin/retry.sh bin/getKnownFlakyTests.sh >> $HOME/project/knownFlakyTests.log
+              cat $HOME/project/knownFlakyTests.log || exit 0
+      # This command delays the execution of steps following it by repeatedly checking every 30 sec waited job.
+      # If the specified job we are waiting for ends with success/fail/canceled, rest of steps proceed.
+      # command will timeout in 1hr 20min and auto-fail
+      - swissknife/wait_for_job:
+          job-name: main_workflow_test
+      - run:
+          name: Deploy PR ENV
+          no_output_timeout: 30m
+          command: |
+              if [ ! -z $LOW_RISK_PR ]; then echo "low-risk change - skipping step"; exit; fi
+              export OUTPUT_DIR="$(pwd)/output/main-workflow/deploy-prenv"
+              bazel run //infra/cicd/cmd/deploy_prenv:deploy_prenv --verbose_failures -- --cicd_env $CICD_ENV
+          environment:
+            NO_COMMENT: "true"
+            WAIT_FOR_DEPLOYMENTS: "true"
+            DEPLOY_X: "true"
+            DEPLOY_QA: "true"
+      - run:
+          name: Run Playwright tests
+          no_output_timeout: 60m
+          command: node common/scripts/install-run-rush.js test:playwright:ci
+      - run:
+          name: Publish test artifacts to S3
+          when: always
+          command: |
+              if [ ! -z $DOC_ONLY_PR ]; then echo "doc-only change - skipping step"; exit; fi
+              CACHE_DIR=output/gh-pages tools/ci/publishArtifacts.js \
+                --branch $CIRCLE_BRANCH \
+                --build-num $CIRCLE_BUILD_NUM \
+                --source output \
+                --match "test/**/*" \
+                --url $CIRCLE_BUILD_URL \
+                --bucket dev-te-build-artifacts
+      - store_test_results:
+          path: output/test
+      - run:
+          <<: *push_stats_to_prometheus
+      - run:
+          name: Create Slack message
+          when: always
+          command: |
+              echo 'export PW_SLACK_TEMPLATE=$(tools/ci/slackNotifyPlaywright.js \
+                --branch $CIRCLE_BRANCH \
+                --build-num $CIRCLE_BUILD_NUM \
+                --bucket dev-te-build-artifacts.s3.us-west-2.amazonaws.com \
+                --url-build $CIRCLE_BUILD_URL \
+                --pr $CIRCLE_PULL_REQUEST \
+                --job $CIRCLE_JOB)' >> $BASH_ENV
+      - slack/notify:
+          event: always
+          template: PW_SLACK_TEMPLATE
+          channel: tmp-te-playwright-test-results
+
+  create_gitops_pr:
+    <<: *docker_default
+    resource_class: 2xlarge+
+    parameters:
+      target:
+        type: string
+        default: any_branch
+      dry_run_arg:
+        type: string
+        default: ""
+      current_branch:
+        type: string
+        default: ""
+    steps:
+      - checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Create Gitops PRs
+          no_output_timeout: 30m
+          command: |
+            bazel run //infra/cicd/cmd/gitops_pr:<< parameters.target >>
+          environment:
+            DRY_RUN_ARG: "<< parameters.dry_run_arg >>"
+            CURRENT_BRANCH: "<< parameters.current_branch >>"
+      - run:
+          <<: *push_stats_to_prometheus
+
+  cleanup_pushgateway_metrics:
+    <<: *docker_default
+    resource_class: large
+    steps:
+      - run:
+          <<: *te_checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Cleanup Pushgateway Metrics
+          no_output_timeout: 1m
+          command: |
+              tools/ci/cleanPushgatewayMetrics.js \
+                --pushgateway https://pushgateway-ns-team-te-ccweb-stage.corp.ethos02-stage-or2.ethos.test.net \
+                --pushgateway-job te_cicd \
+                --pushgateway-job te_performance \
+                --pushgateway-metrics-retention 1h
+
+  test_ci_job:
+    <<: *docker_testing
+    resource_class: small
+    steps:
+      - run:
+          <<: *te_checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: testing-command
+          no_output_timeout: 30m
+          command: |
+            bazel run //infra/cicd/cmd/cleanup_dev_stage:cleanup_configmaps
+
+  terraform_plan_job:
+    <<: *docker_default
+    resource_class: large
+    steps:
+      - run:
+          <<: *te_checkout
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Terraform Plan
+          command: |
+            bazel run //infra/terraform:terraform -- plan
+      - run:
+          <<: *push_stats_to_prometheus
+
+  terraform_apply_job:
+    <<: *docker_default
+    resource_class: large
+    steps:
+      - run:
+          <<: *te_checkout
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Terraform Apply
+          command: |
+            bazel run //infra/terraform:terraform -- apply
+      - run:
+          <<: *push_stats_to_prometheus
+
+  deploy_pathkit:
+    <<: *docker_default
+    resource_class: large
+    steps:
+      - run:
+          <<: *te_checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          no_output_timeout: 30m
+          command: |
+            source shared/pathkit/linux/build.sh
+      - run:
+          <<: *push_stats_to_prometheus
+
+  deploy_libtxe:
+    <<: *docker_default
+    resource_class: large
+    steps:
+      - run:
+          <<: *te_checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+          <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          no_output_timeout: 30m
+          command: |
+            platform/foundation/text/libtxe/pipeline/deploy.sh
+      - run:
+          <<: *push_stats_to_prometheus
+
+  shadow_bazel_build_and_test:
+    parameters:
+      config:
+        type: string
+        default: ci
+      cache_enabled:
+        type: boolean
+        default: true
+      build_first:
+        type: boolean
+        default: true
+      parallelism:
+        type: integer
+        default: 1
+    <<: *docker_default
+    resource_class: 2xlarge+
+    parallelism: << parameters.parallelism >>
+    steps:
+      - run:
+          <<: *te_checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *git_config
+      - run:
+          name: Configure ~/.netrc
+          command: |
+              ARTIFACTORY_USER=$ARTIFACTORY_USER \
+              ARTIFACTORY_API_KEY=$ARTIFACTORY_API_KEY \
+              ARTIFACTORY_CLOUD_API_KEY=$ARTIFACTORY_CLOUD_API_KEY \
+              bin/netrc.sh > ~/.netrc
+      - run:
+           <<: *npmrc_config
+      - run:
+          name: Memory Usage Monitoring
+          command: |
+              while true; do
+                sleep 5
+                ps auxwwf | head -1; ps auxwwf | sort -rnk 4 | head -5
+                echo "================================================"
+              done
+          background: true
+      - run:
+          name: Setup
+          command: |
+            # The default bashrc bails on non-interactive terminals. Reset it so
+            # we can add Emscripten env to it.
+            echo "" > $HOME/.bashrc
+
+            # Add npm binaries to PATH
+            export PATH=$(npm bin):$PATH
+            echo 'export PATH=$(npm bin):$PATH' >> "$BASH_ENV"
+
+            # Setup Bazel for CI
+            # Allow Bazel JVM to use up to 1/2 of the entire 2xlarge memory
+            echo "startup --host_jvm_args=-Xmx16G" >> .bazelrc.user
+            # Enable CI configuration for all commands
+            echo "build --config=ci" >> .bazelrc.user
+
+            export BAZEL_OUTPUT_BASE=$(bazel info output_base)
+            echo "export BAZEL_OUTPUT_BASE=$BAZEL_OUTPUT_BASE" >> "$BASH_ENV"
+
+            # Setup EngFlow credentials
+            echo "build:ci-engflow --bes_header 'x-engflow-auth-method=jwt-v0'" >> .bazelrc.user
+            echo "build:ci-engflow --bes_header 'x-engflow-auth-token=${ENGFLOW_AUTH_TOKEN}'" >> .bazelrc.user
+            echo "build:ci-engflow --remote_header 'x-engflow-auth-method=jwt-v0'" >> .bazelrc.user
+            echo "build:ci-engflow --remote_header 'x-engflow-auth-token=${ENGFLOW_AUTH_TOKEN}'" >> .bazelrc.user
+
+            # Set docker registry sredentials
+            echo "$ARTIFACTORY_CLOUD_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-tester-snapshot.dr-uw2.testitc.com
+            echo "$ARTIFACTORY_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-hub-remote.dr.corp.test.com
+
+            # Resync @npm repo as bad caches of ~/.npmrc can lead to auth issues
+            # There's an impact on the speed of the run so we need to get away from using ~/.npmrc (so scopes.txt)
+            # https://github.com/aspect-build/rules_js/blob/main/docs/npm_translate_lock.md#npm_translate_lock-use_home_npmrc
+            # https://jira.corp.test.com/browse/te-27459
+            bazel sync --only=npm
+      - when:
+          condition:
+            not: << parameters.cache_enabled >>
+          steps:
+            - run:
+                name: Disable Cache
+                command: |
+                  echo "build:ci --noremote_accept_cached" >> .bazelrc.user
+                  echo "build:ci --nocache_test_results" >> .bazelrc.user
+      - run:
+          name: Refresh .bazelignore
+          no_output_timeout: 5m
+          command: |
+            # Still needed atm to ignore any node_modules folders found in the workspace from the image cache
+            awk '/^# generated node_modules/{f=1;next}!f' .bazelignore >> ~/.bazelignore
+            echo "# generated node_modules ignores" >> ~/.bazelignore
+            find . -maxdepth 6 -type d -name "node_modules" -not -path "./common/*" >> ~/.bazelignore
+            echo "# end of generated node_modules ignores" >> ~/.bazelignore
+            awk '/^# end of generated node_modules/{f=1;next}f' .bazelignore >> ~/.bazelignore
+            mv ~/.bazelignore .bazelignore
+      - run:
+          name: Run BUILD Generator
+          no_output_timeout: 5m
+          command: |
+            cd experimental/shadow-build
+            # Reuse up CI configuration customizations form the main workspace
+            cp ../../.bazelrc.user .bazelrc.user
+            # Build generator doesn't yet support ci-buildbarn config, so we're just going to use ci for now
+            # MS: Why can't we just do bazel run? It hangs!
+            bazel build //build-generator --config=ci
+            bazel shutdown
+            node bazel-bin/build-generator/dist/index.js
+      - when:
+          condition: << parameters.build_first >>
+          steps:
+            - run:
+                name: Build
+                no_output_timeout: 60m
+                command: |
+                  bazel build \
+                  --build_tag_filters=rush-build \
+                  --config=<< parameters.config >> \
+                  -- //...
+      - run: &shadow_bazel_build_and_test_test_step
+          name: Test
+          no_output_timeout: 60m
+          command: |
+            if [ "<< parameters.cache_enabled >>" == "false" ] && [ "<< parameters.build_first >>" == "false" ]; then
+              # clean local workspace to force rebuild
+              bazel clean --async
+            fi
+            bazel test \
+            --test_tag_filters=mocha-test,wtr-test,locales-test,dsl-test \
+            --config=<< parameters.config >> \
+            --build_tests_only \
+            -- //...
+      - run:
+          name: Copy logs
+          command: |
+            mkdir -p /tmp/bazel_testlogs
+            if [ -d "bazel-testlogs" ]; then
+              find -L bazel-testlogs -type f -name "attempt_*.log" | while IFS= read -r f
+              do
+                cp -v "$f" "/tmp/bazel_testlogs/${f//\//_}"
+              done
+            fi
+            cd "$BAZEL_OUTPUT_BASE"
+            mkdir -p /tmp/bazel_logs
+            cp -v java.log /tmp/bazel_logs/ || true
+            cp -v command.profile.gz /tmp/bazel_logs/ || true
+            cp -v server/jvm.out /tmp/bazel_logs/ || true
+            cp -rv bazel-workers /tmp/bazel_logs/ || true
+          when: always
+      - store_artifacts:
+          path: /tmp/bazel_testlogs
+      - store_artifacts:
+          path: /tmp/bazel_logs
+      - slack/notify:
+          branch_pattern: main
+          channel: te-shadow-build-alert
+          event: fail
+          <<: *slack-failure-notify-template
+      - slack/notify:
+          branch_pattern: main
+          channel: te-shadow-build-alert
+          event: pass
+          <<: *slack-success-notify
+      - slack/notify:
+          branch_pattern: .*\.bazel$
+          channel: te-shadow-build-alert-personal
+          event: fail
+          <<: *slack-failure-notify-template
+      - slack/notify:
+          branch_pattern: .*\.bazel$
+          channel: te-shadow-build-alert-personal
+          event: pass
+          <<: *slack-success-notify
+
+  # Used only by CICD branches
+  shellcheck:
+    <<: *docker_default
+    parameters:
+      main_alert_channel:
+        type: string
+        default: "te-cicd-alert"
+    resource_class: small
+    steps:
+      - run:
+          <<: *skip-if-ignore-matches
+      - run:
+          <<: *te_checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *netrc_config
+      - run:
+           <<: *npmrc_config
+      - run:
+          name: Install dependencies
+          command: node common/scripts/install-run-rush.js install
+      - run:
+          name: Shellcheck
+          command: |
+            git ls-files '*.sh' | xargs shellcheck
+      - run:
+          <<: *push_stats_to_prometheus
+      - slack/notify:
+          <<: *slack-failure-notify
+      - slack/notify:
+          <<: *slack-main-branch-failure-notify
+
+  all_jobs_passed_check:
+    docker:
+      - image: cimg/base:2022.03
+    steps:
+      - slack/notify:
+          <<: *slack-success-notify
+
+  des_loadtest_job:
+    <<: *docker_default
+    resource_class: small
+    steps:
+      - run:
+          <<: *te_checkout
+      - add_ssh_keys:
+          <<: *ccwutil_github_ssh_user_key
+      - run:
+          <<: *npmrc_config
+      - run:
+          <<: *netrc_config
+      - run:
+          name: Install dependencies
+          command: |
+            echo << pipeline.parameters.des_load_test_cleanup >>
+            echo << pipeline.parameters.des_load_test_build >>
+            echo << pipeline.parameters.des_load_test >>
+            node common/scripts/install-run-rush.js install
+      - run:
+          name: Set Artifactory Credentials
+          command: |
+            echo "$ARTIFACTORY_CLOUD_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-tester-snapshot.dr-uw2.testitc.com
+            echo "$ARTIFACTORY_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-hub-remote.dr.corp.test.com
+            bazel run //infra/cicd/cmd/set_sys_credentials:set_credentials
+      - when:
+          condition: << pipeline.parameters.des_load_test_cleanup >>
+          steps:
+            - run:
+                name: Clean up
+                command: |
+                  cd services/docengine-e2e-service
+                  node ../../common/scripts/install-run-rush.js update
+                  node ../../common/scripts/install-run-rush.js build:release --to @te/docengine-e2e-service
+                  kubectl -n  ns-team-te-des-loadtest --context ethos502-stage-irl1 delete jobs $(kubectl get jobs -n  ns-team-te-des-loadtest --context ethos502-stage-irl1 -o custom-columns=:.metadata.name)
+                  node ../../common/scripts/install-run-rushx.js test:clean:irl1
+      - when:
+          condition: << pipeline.parameters.des_load_test_build >>
+          steps:
+            - run:
+                name: Build
+                command: |
+                  ./services/docengine-e2e-service/paas_build.sh
+      - when:
+          condition: << pipeline.parameters.des_load_test >>
+          #Need to break down into multiple part as k8 token valid for 1 hour only. Need to relogin before next run
+          steps:
+            - run:
+                name: Generate load 1
+                no_output_timeout: 30m
+                command: |
+                  ./services/docengine-e2e-service/kubernetes/load_generate.sh 1
+      - run:
+          name: Set Artifactory Credentials
+          #Need to relogin before next run. k8 1 hour token
+          command: |
+            echo "$ARTIFACTORY_CLOUD_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-tester-snapshot.dr-uw2.testitc.com
+            echo "$ARTIFACTORY_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-hub-remote.dr.corp.test.com
+            bazel run //infra/cicd/cmd/set_sys_credentials:set_credentials
+      - when:
+          condition: << pipeline.parameters.des_load_test >>
+          steps:
+            - run:
+                name: Generate load 2
+                no_output_timeout: 30m
+                command: |
+                  ./services/docengine-e2e-service/kubernetes/load_generate.sh 2
+      - run:
+          name: Set Artifactory Credentials
+          command: |
+            echo "$ARTIFACTORY_CLOUD_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-tester-snapshot.dr-uw2.testitc.com
+            echo "$ARTIFACTORY_API_KEY" | docker login --username "$ARTIFACTORY_USER" --password-stdin docker-hub-remote.dr.corp.test.com
+            bazel run //infra/cicd/cmd/set_sys_credentials:set_credentials
+      - when:
+          condition: << pipeline.parameters.des_load_test >>
+          steps:
+            - run:
+                name: Generate load 3
+                no_output_timeout: 60m
+                command: |
+                  ./services/docengine-e2e-service/kubernetes/load_generate.sh 3
+      - slack/notify:
+          channel: te-des-alert-stage
+          event: fail
+          <<: *slack-failure-notify-template
+
+  test_coverage_project_x:
+      <<: *docker_default
+      resource_class: xlarge
+      steps:
+          - rush_build_bootstrap_commands
+          - run:
+              name: Build
+              command: |
+                  node common/scripts/install-run-rush.js build -t @te/project-x
+                  cd apps/project-x/web
+                  node ../../../common/scripts/install-run-rushx.js _phase:test
+              environment:
+                  CONCURRENCY: 4 # WTR only setting, amount of test files to run concurrently
+                  BROWSERS: "chromium" # force WTR to use only chromium
+                  RUN_COVERAGE: "true" # forced coverage for this job in wtr-test wrapper script
+          - store_test_results:
+              path: output/test
+          - run:
+              name: Publish test and coverage results
+              when: always
+              command: |
+                  tools/ci/publishArtifacts.js \
+                  --branch $CIRCLE_BRANCH \
+                  --build-num $CIRCLE_BUILD_NUM \
+                  --source output \
+                  --match coverage-wtr/project-x/** \
+                  --url $CIRCLE_BUILD_URL \
+                  --bucket dev-te-build-artifacts
+          - run:
+              name: Post coverage results on slack
+              when: always
+              # Send message to express-engineering (ID: C01CHCUTPJ4)
+              command: |
+                  tools/ci/slackNotifyCoverage.js \
+                  --project-name @te/project-x --report output/coverage-wtr/project-x \
+                  --channel C01CHCUTPJ4 --slack-token $SLACK_te_BOT_TOKEN \
+                  --url-build $CIRCLE_BUILD_URL \
+                  --url-aws https://dev-te-build-artifacts.s3.us-west-2.amazonaws.com/$CIRCLE_BRANCH/$CIRCLE_BUILD_NUM/coverage-wtr/project-x/index.html
+          - run:
+                <<: *push_stats_to_prometheus
+
+
+
+  analytics_healthcard_report:
+      <<: *docker_default
+      resource_class: small
+      steps:
+         - rush_build_bootstrap_commands
+         - run:
+             <<: *skip-if-ignore-matches
+         - run:
+             # Build the specs-extractor package
+             name: Build
+             command: |
+                 node common/scripts/install-run-rush.js build --to @te/specs-extractor
+         - run:
+             # Run the analytics-validator to generate the healthcard data and report.
+             name: Run Analytics Validator
+             command: |
+                 node common/scripts/install-run-rush.js lint:analytics
+         - run:
+             # Copy reports to output dir
+             name: Copy reports to output
+             command: |
+                 find tools/specs-extractor/dist/analytics -name "*.json" -exec cp {} output/analytics \;
+         - run:
+              # Publish the report to "dev-te-analytics-healthcard" S3 bucket, use --overwrite --destination latest to,
+              # overwrite objects on the same s3 path every time it runs. ie: "s3://dev-te-analytics-healthcard/latest/analytics"
+             name: Push Analytics healthcard data to S3
+             command: |
+                 tools/ci/publishArtifacts.js \
+                 --branch $CIRCLE_BRANCH \
+                 --build-num $CIRCLE_BUILD_NUM \
+                 --source output/ \
+                 --match analytics/**  \
+                 --url $CIRCLE_BUILD_URL \
+                 --bucket dev-te-analytics-healthcard \
+                 --overwrite \
+                 --destination latest
+         - finish_steps_commands
+
+  # THE JOB NAME WILL BE CHANGED AFTER THE POST DEPLOYMENT QUALITY CHECKPOINT IS DECIDED
+  cpf_post_deploy_test:
+    <<: *docker_default
+    resource_class: 2xlarge
+    steps:
+      - rush_build_bootstrap_commands
+      - run:
+          name: Build
+          no_output_timeout: 30m
+          command:
+            node common/scripts/install-run-rush.js build:release --parallelism 14 --timeline --verbose
+      - run:
+          name: CPF Post Deployment API Smoke Tests
+          no_output_timeout: 30m
+          command:
+            node common/scripts/install-run-rush.js test:cpf-post-deploy --parallelism 6 --verbose
+      - store_test_results:
+          path: output/test
+      - run:
+          <<: *copy_rush_logs
+      - slack/notify:
+          channel: te-automation-all-tests-results
+          event: pass
+          <<: *slack-success-notify
+      - slack/notify:
+          channel: te-automation-all-tests-results
+          event: fail
+          <<: *slack-failure-notify-template
+
 workflows:
-  say-hello-workflow:
+  version: 2.1
+  # the merge_main parameter is used to switch between two workflows
+  # merge_main_workflow and build_and_test_workflow
+  merge_main_workflow:
+    when: << pipeline.parameters.merge_main >>
     jobs:
-      - say-hello
+      - merge_main:
+          filters:
+            branches:
+              ignore:
+                - main
+  build_and_test_workflow:
+    unless: << pipeline.parameters.merge_main >>
+    jobs:
+      - runner_rush_build_and_test:
+          resource_class: "ns_tester/rc_cicd_ccc_prod"
+          main_alert_channel: "te-cicd-alert"
+          filters:
+            branches:
+              ignore:
+                - /^g11n.*/
+      - runner_rush_build_debug_and_unit_test:
+          resource_class: "ns_tester/rc_cicd_ccc_prod"
+          main_alert_channel: "te-cicd-alert"
+          filters:
+            branches:
+              ignore:
+                - /^g11n.*/
+      - bazel_build_and_test:
+          filters:
+            branches:
+              ignore:
+                - /^g11n.*/
+      - cpf_build_and_test:
+          requires:
+            # ensure the build:release results are cached
+            - runner_rush_build_and_test
+          filters:
+            branches:
+              ignore:
+                - main
+                - /^release.*/
+                - /^deploy.*/
+                - /^terraform.*/
+                - /^cicd.*/
+                - /^g11n.*/
+      - runner_rush_integration_test:
+          resource_class: "ns_tester/rc_cicd_ccc_prod"
+          main_alert_channel: "te-cicd-alert"
+          requires:
+            - runner_rush_build_and_test
+          filters:
+            branches:
+              ignore:
+                - /^g11n.*/
+      - deploy_prenv:
+          filters:
+            branches:
+              ignore:
+                - /^terraform.*/
+                - /^g11n.*/
+                - main
+      - deploy_prenv_aws:
+          filters:
+            branches:
+              ignore:
+                - /^terraform.*/
+                - /^g11n.*/
+                - main
+      - chunk_check:
+          requires:
+            # ensure the build:release results are cached
+            - runner_rush_build_and_test
+          filters:
+            branches:
+              ignore:
+               - /^g11n.*/
+      - deploy_stage_aws:
+          requires:
+            # ensure the build:release results are cached
+            - runner_rush_build_and_test
+          filters:
+            branches:
+              only:
+               - main
+      #- pr_perf_test:
+      #    requires:
+      #      # ensure the build:release results are cached
+      #      - rush_build_and_test
+      #    filters:
+      #      branches:
+      #        ignore:
+      #          - main
+      #          - /^release.*/
+      #          - /^deploy.*/
+      #          - /^terraform.*/
+      #          - /^cicd.*/
+      #          - /^g11n.*/
+      - pr_smoke_test:
+          requires:
+            # ensure the build:release results are cached
+            - runner_rush_build_and_test
+          filters:
+            branches:
+              ignore:
+                - /^g11n.*/
+                - main
+      - main_workflow_test:
+          requires:
+            # ensure the build:release results are cached
+            - runner_rush_build_and_test
+          filters:
+            branches:
+              only:
+                - main
+      - playwright_e2e_tests:
+          requires:
+            # ensure the build:release results are cached
+            - runner_rush_build_and_test
+          # Note we don't require main_workflow_test, it needs to run after main_workfow_test
+          filters:
+            branches:
+              only:
+                - main
+      - shellcheck:
+          filters:
+            branches:
+              ignore:
+                - /^g11n.*/
+
+      # Please don't add branch filters to this job! SonarQube Analisys – another
+      # required check depends on it, and if this job is missing for some branches
+      # than the required check (SonarQube Analisys) will hang forever.
+      - scan_sonarqube
+
+      - all_jobs_passed_check:
+          requires:
+            - runner_rush_build_and_test
+            - runner_rush_build_debug_and_unit_test
+            - bazel_build_and_test
+            - runner_rush_integration_test
+            - deploy_prenv
+            - chunk_check
+            #- pr_perf_test
+            - pr_smoke_test
+            # https://jira.corp.test.com/browse/te-24982
+            # - main_workflow_test
+            - shellcheck
+          filters:
+            branches:
+              ignore:
+                - main
+                - /^terraform.*/
+                - /^g11n.*/
+  runner_build_and_test_workflow:
+    jobs:
+      - runner_pr_smoke_test:
+          name: runner_dev_pr_smoke_test
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+          requires:
+            - runner_dev_rush_build_and_test
+          filters:
+            branches:
+              only:
+                - /^runner.*/
+      - runner_rush_build_and_test:
+          name: runner_dev_rush_build_and_test
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+          filters:
+            branches:
+              only:
+                - /^runner.*/
+      - runner_rush_build_debug_and_unit_test:
+          name: runner_dev_rush_build_debug_and_unit_test
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+          filters:
+            branches:
+              only:
+                - /^runner.*/
+      - runner_rush_integration_test:
+          name: runner_dev_rush_integration_test
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+          requires:
+            - runner_dev_rush_build_and_test
+          filters:
+            branches:
+              only:
+               - /^runner.*/
+      - runner_cpf_build_and_test:
+          name: runner_dev_cpf_build_and_test
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+          requires:
+            - runner_dev_rush_build_and_test
+          filters:
+            branches:
+              only:
+               - /^runner.*/
+      - runner_chunk_check:
+          name: runner_dev_chunk_check
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+          requires:
+            - runner_dev_rush_build_and_test
+          filters:
+            branches:
+              only:
+               - /^runner.*/
+
+  # cron_runner_build_and_test_workflow:
+  #   triggers:
+  #     - schedule:
+  #         # Time is based on UTC+0. Use midnight Pacific here.
+  #         cron: "0 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23 * * *"
+  #         filters:
+  #           branches:
+  #             only:
+  #               - main
+    jobs:
+      - runner_main_workflow_test:
+          name: runner_dev_main_workflow_test
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+          requires:
+            - runner_dev_rush_build_and_test
+      - runner_rush_build_and_test:
+          name: runner_dev_rush_build_and_test
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+      - runner_rush_build_debug_and_unit_test:
+          name: runner_dev_rush_build_debug_and_unit_test
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+      - runner_rush_integration_test:
+          name: runner_dev_rush_integration_test
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+          requires:
+            - runner_dev_rush_build_and_test
+      - runner_chunk_check:
+          name: runner_dev_chunk_check
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+          requires:
+            - runner_dev_rush_build_and_test
+      - runner_cpf_build_and_test:
+          name: runner_dev_cpf_build_and_test
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+          requires:
+            - runner_dev_rush_build_and_test
+
+  # cron_runner_build_and_test_workflow_uncached:
+  #   triggers:
+  #     - schedule:
+  #         # Time is based on UTC+0. Use midnight Pacific here.
+  #         cron: "0 0,3,6,9,12,15,18,21 * * *"
+  #         filters:
+  #           branches:
+  #             only:
+  #               - main
+    jobs:
+      - runner_rush_build_and_test:
+          name: runner_dev_rush_build_and_test_cache_disabled
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+          cache_enabled: false
+      - runner_rush_build_debug_and_unit_test:
+          name: runner_dev_rush_build_debug_and_unit_test_cache_disabled
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+          cache_enabled: false
+      - runner_rush_integration_test:
+          name: runner_dev_rush_integration_test_cache_disabled
+          resource_class: "ns_tester/rc_cicd_ccc_dev"
+          cache_enabled: false
+          requires:
+            - runner_dev_rush_build_and_test_cache_disabled
+
+  des_loadtest_workflow:
+    when:
+      condition:
+        equal: [<< pipeline.parameters.des_load_test >>, << pipeline.parameters.des_load_test_build >>,<< pipeline.parameters.des_load_test_cleanup >>]
+    jobs:
+      - des_loadtest_job:
+          filters:
+            branches:
+              only:
+                - /^desloadtest.*/
+
+  cicd_workflow:
+    jobs:
+      - shellcheck:
+          filters:
+            branches:
+              only:
+                - /^cicd.*/
+      - bazel_build_and_test:
+          requires:
+            - shellcheck
+          filters:
+            branches:
+              only:
+                - /^cicd.*/
+
+  g11n_workflow:
+    jobs:
+      - runner_rush_build_and_test:
+          # TODO: [te-30751] Fix unwanted '-1' suffix that giving this correct name would cause
+          name: runner_rush_build_and_test_for_g11n
+          filters:
+            branches:
+              only:
+                - /^g11n.*/
+      - shellcheck:
+          filters:
+            branches:
+              only:
+                - /^g11n.*/
+      - bazel_build_and_test:
+          requires:
+            - shellcheck
+          filters:
+            branches:
+              only:
+                - /^g11n.*/
+      - deploy_prenv:
+          filters:
+            branches:
+              only:
+                - /^g11n.*/
+
+  shadow_build_and_test_workflow:
+    jobs:
+      - shadow_bazel_build_and_test:
+          name: shadow_bazel_build_and_test_local
+          config: ci
+          filters:
+            branches:
+              only:
+                - /.*\.bazel$/
+                - /.*build-generator.*/ # to remove once it gets in main
+                - main
+
+      ### Enable if testing execution on BuildBarn
+      # - shadow_bazel_build_and_test:
+      #     name: shadow_bazel_build_and_test_buildbarn
+      #     config: ci-buildbarn
+      #     filters:
+      #       branches:
+      #         only:
+      #           - /.*\.bazel$/
+      #           - main
+      ### Temporarily disabled until EngFlow gets back
+      # - shadow_bazel_build_and_test:
+      #     name: shadow_bazel_build_and_test
+      #     config: ci-engflow
+      #     filters:
+      #       branches:
+      #         only:
+      #           - /.*\.bazel$/
+      #           - main
+
+  terraform:
+    jobs:
+      - terraform_plan_job:
+          filters:
+            branches:
+              only:
+                - /^terraform.*/
+      - terraform_apply_job:
+          filters:
+            branches:
+              only:
+                - main
+
+  deploy_pathkit_workflow:
+    jobs:
+      - deploy_pathkit:
+          filters:
+            branches:
+              only:
+                - /^pathkit-local.*/
+
+  deploy_libtxe_workflow:
+    jobs:
+      - deploy_libtxe:
+          filters:
+            branches:
+              only:
+                - /^publish/libtxe.*/
+
+  release_branch_workflow:
+    jobs:
+      - create_gitops_pr:
+          name: generic_gitops_prs_generation
+          filters:
+            branches:
+              ignore:
+                - /^release\/cpf.*/
+              only:
+                - main
+                - /^release.*/
+                - deploy/stage-daily
+      - create_gitops_pr:
+          name: pre_prod_release_branch_gitops_prs_generation
+          target: pre_prod_release_branch
+          filters:
+            branches:
+              only:
+                - /^release\/projectx.*/
+      - create_gitops_pr:
+          name: cpf_branch_gitops_prs_generation
+          target: cpf_branch_gitops
+          filters:
+            branches:
+              only:
+                - /^release\/cpf.*/
+                - /^release\/projectx.*/
+                - main
+      # TODO: remove once the deprecated_main_branch script has nothing to do
+      - create_gitops_pr:
+          name: deprecated_main_branch_gitops_prs_generation
+          target: deprecated_main_branch
+          filters:
+            branches:
+              only:
+                - main
+      # TODO: remove once verified that deprecated_prod_release_branch script has nothing to do. It uses prod config, which is not used.
+      - create_gitops_pr:
+          name: deprecated_prod_release_branch_gitops_prs_generation
+          target: deprecated_prod_release_branch
+          filters:
+            branches:
+              only:
+                - /^release\/projectx.*/
+
+  temp_stage_release_deploy:
+    jobs:
+      - deploy_projectx_stage_daily:
+          name: deploy_projectx_stage_daily
+          filters:
+            branches:
+              only:
+                - release/projectx
+      - deploy_quickactions_stage_daily:
+          name: deploy_quickactions_stage_daily
+          filters:
+            branches:
+              only:
+                - release/projectx
+
+  # nightly:
+  #   triggers:
+  #     - schedule:
+  #         # Time is based on UTC+0. Use midnight Pacific here.
+  #         cron: "0 7 * * *"
+  #         filters:
+  #           branches:
+  #             only:
+  #               - main
+    jobs:
+      - clean_artifacts
+      - create_sonarqube_tickets
+      - test_coverage_project_x
+
+  # build_and_publish_cache_image:
+  #   jobs:
+  #     - build_docker_cache_image
+  #   triggers:
+  #     - schedule:
+  #         # rebuild cache image 10pm Pacific daily
+  #         cron: "0 5 * * *"
+  #         filters:
+  #           branches:
+  #             only:
+  #               - main
+
+  bot-deployment:
+    jobs:
+      - deploy_stage:
+          filters:
+            branches:
+              only:
+                - main
+      - deploy_stage_projectx:
+          filters:
+            branches:
+              only:
+                - main
+
+  # --------------------------------
+  # Cronworkflows
+  # --------------------------------
+  # cronworkflow_cleanup:
+  #   jobs:
+  #     - cleanup_pushgateway_metrics
+  #   triggers:
+  #     - schedule:
+  #         # Every 15 minutes
+  #         # Slash is not supported: https://circleci.com/docs/2.0/configuration-reference/#cron
+  #         cron: "0,15,30,45 * * * *"
+  #         filters:
+  #           branches:
+  #             only:
+  #               - main
+
+  cronworkflow_rpms_cleanup:
+    jobs:
+      - cleanup_traffic_target:
+          rpms_tenant: project-x
+          name: tt_cleanup_for_project_x
+      - cleanup_traffic_target:
+          rpms_tenant: quick-actions
+          name: tt_cleanup_for_quick_actions
+      - cleanup_builds:
+          rpms_tenant: project-x
+          name: builds_cleanup_for_project_x
+      - cleanup_builds:
+          rpms_tenant: quick-actions
+          name: builds_cleanup_for_quick_actions
+    triggers:
+      # - schedule:
+      #     cron: "0 12 * * *"
+      #     filters:
+      #       branches:
+      #         only:
+      #           - main
+
+  cronworkflow_rush_build_and_test_cache_disabled:
+    jobs:
+      - runner_rush_build_and_test:
+          name: runner_rush_build_and_test_cache_disabled
+          resource_class: "ns_tester/rc_cicd_ccc_prod"
+          main_alert_channel: "te-cicd-alert"
+          cache_enabled: false
+      - runner_rush_build_debug_and_unit_test:
+          name: runner_rush_build_debug_and_unit_test_cache_disabled
+          resource_class: "ns_tester/rc_cicd_ccc_prod"
+          main_alert_channel: "te-cicd-alert"
+          cache_enabled: false
+      - runner_rush_integration_test:
+          name: runner_rush_integration_test_cache_disabled
+          resource_class: "ns_tester/rc_cicd_ccc_prod"
+          main_alert_channel: "te-cicd-alert"
+          cache_enabled: false
+          requires:
+            # ensure the build:release results are cached
+            - runner_rush_build_and_test_cache_disabled
+    triggers:
+      - schedule:
+          # Every 8 hours
+          # cron: "0 0,8,16 * * *"
+          filters:
+            branches:
+              only:
+                - main
+# Temporarily disabling until next prod release
+#   deploy_projectx_stage_daily:
+#     jobs:
+#       - deploy_projectx_stage_daily
+#       - deploy_quickactions_stage_daily
+#     triggers:
+#       - schedule:
+#          # This runs at 0200 and 1400 UTC/1900 and 0700 PDT/1800 and 0600 PST
+#           cron: "00 02,14 * * *"
+#           filters:
+#             branches:
+#               only:
+#                 - main
+                
+  run_videoexport_integration_daily:
+    jobs:
+      - video_export_integration_tests
+    triggers:
+      - schedule:
+          # This runs at IST 0900 and 1800 (UTC/0330 and 1230)
+          # cron: "30 03,12 * * 1-5"
+          filters:
+            branches:
+              only:
+                - main
+
+  run_analytics_healthcard_report:
+    jobs:
+      # This runs to generate Analytics Healthcard report from main branch
+      - analytics_healthcard_report
+    triggers:
+      - schedule:
+          # This runs once, 30 minutes past 15:00 UTC
+          # cron: "30 15 * * *"
+          filters:
+            branches:
+              only:
+                - main
+
+  # TEMP CRON WORKFLOW UNTIL STAGE DEPLOYMENT AUTOMATION IS COMPLETED USING DEPLOYMENT SERVICE FOR CPF SERVICES
+  cpf_post_deploy_test_cronworkflow:
+    jobs:
+      - cpf_post_deploy_test
+    triggers:
+      - schedule:
+          # Every 1 hour
+          # cron: "0 * * * *"
+          filters:
+            branches:
+              only:
+                - main
+  # --------------------------------
+  # Workflows used for debugging
+  # --------------------------------
+  # adjust to your own branch name when needed for test-building the cacher image
+  test_cache_image:
+    jobs:
+      - test_docker_cache_image:
+          filters:
+            branches:
+              only:
+                - cicd/mstoichi/upgrade-maven
+
+  # Modify the branch filter and the current_branch parameter
+  # to do a dry run on selected gitops jobs
+  gitops_prs_generation_test_workflow:
+    unless: << pipeline.parameters.merge_main >>
+    jobs:
+      - create_gitops_pr:
+          name: generic_gitops_prs_generation_test
+          # Enables dry-run on this job
+          dry_run_arg: --dry_run
+          # Add here the branch to gitops against
+          current_branch: main
+          filters:
+            branches:
+              only:
+                - /^cicd/.*fake.*/
+      - create_gitops_pr:
+          name: deprecated_main_branch_gitops_prs_generation_test
+          # Enables dry-run on this job
+          dry_run_arg: --dry_run
+          # Add here the branch to gitops against
+          current_branch: main
+          target: deprecated_main_branch
+          filters:
+            branches:
+              only:
+                - /^cicd/.*fake.*/
+      - create_gitops_pr:
+          name: cpf_branch_gitops_prs_generation_test
+          # Enables dry-run on this job
+          dry_run_arg: --dry_run
+          # Add here the branch to gitops against
+          current_branch: main
+          target: cpf_branch_gitops
+          filters:
+            branches:
+              only:
+                - /^cicd/.*fake.*/
+
+  fake_build_workflow:
+    unless: << pipeline.parameters.merge_main >>
+    jobs:
+      - runner_rush_build_and_test:
+          name: runner_fake_rush_build_and_test
+          filters:
+            branches:
+              only:
+                - rochon/te-21727-static-ui-deploy
+      - deploy_stage_aws:
+          requires:
+            # ensure the build:release results are cached
+            - runner_fake_rush_build_and_test
+          filters:
+            branches:
+              only:
+                - rochon/te-21727-static-ui-deploy
