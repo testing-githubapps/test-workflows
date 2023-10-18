@@ -1,0 +1,16 @@
+name: testing Memory Usage monitoring
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test_monitor:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Memory Usage Monitoring
+      run: |-
+        while true; do
+          sleep 5
+          ps auxwwf | head -1; ps auxwwf | sort -rnk 4 | head -5
+          echo "================================================"
+        done
