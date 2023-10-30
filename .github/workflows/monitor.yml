@@ -8,9 +8,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Memory Usage Monitoring
-      run: |-
-        while true; do
-          sleep 5
-          ps auxwwf | head -1; ps auxwwf | sort -rnk 4 | head -5
-          echo "================================================"
-        done
+      run: echo "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
