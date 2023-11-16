@@ -12,7 +12,7 @@ jobs:
       - name: Checkout Google Test
         uses: actions/checkout@v4.1.0
         with:
-          repository: Adobe-HZ-POC/googletest
-          path: testing-githubapps/test-repo
+          repository: testing-githubapps/test-repo
+          path: test123
           ref: master
           token: ${{ secrets.ADMIN_TOKEN }}
