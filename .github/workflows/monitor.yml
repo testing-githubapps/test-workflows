@@ -9,7 +9,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout Google Test
+      - name: Checkout other repo
         uses: actions/checkout@v4.1.0
         with:
           repository: testing-githubapps/test-repo
@@ -19,3 +19,7 @@ jobs:
 
       - name: look at path
         run: ls -la
+
+        
+      - name: look at second repo
+        run: ls -la test123
