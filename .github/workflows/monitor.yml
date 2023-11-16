@@ -7,5 +7,12 @@ jobs:
   test_monitor:
     runs-on: ubuntu-latest
     steps:
-    - name: Memory Usage Monitoring
-      run: echo "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      - uses: actions/checkout@v4
+
+      - name: Checkout Google Test
+        uses: actions/checkout@v4.1.0
+        with:
+          repository: Adobe-HZ-POC/googletest
+          path: testing-githubapps/test-repo
+          ref: master
+          token: ${{ secrets.ADMIN_TOKEN }}
