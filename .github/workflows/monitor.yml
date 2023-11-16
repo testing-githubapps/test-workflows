@@ -16,3 +16,6 @@ jobs:
           path: test123
           ref: master
           token: ${{ secrets.ADMIN_TOKEN }}
+
+      - name: look at path
+        run: ls -la
