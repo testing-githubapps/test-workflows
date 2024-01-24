@@ -26,3 +26,9 @@ jobs:
 
       - name: look at second repo
         run: ls -la test123/hello
+
+      - name: Print to Log
+        id: print-to-log
+        uses: actions/hello-world-docker-action@main
+        with:
+          who-to-greet: "ephemeral-runner"
